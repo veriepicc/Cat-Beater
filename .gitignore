@@ -1,0 +1,25 @@
+# Ignore everything by default
+*
+
+# Unignore the ignore file itself
+!.gitignore
+
+# Keep the top-level test script
+!test.cat
+
+# Keep the selfhost compiler sources
+!selfhost/
+!selfhost/**
+
+# Keep source tree and solution/projects
+!src/
+!src/**
+!CatBeater.sln
+!CatBeater.vcxproj
+!CatBeater.vcxproj.filters
+!CatBeater.vcxproj.user
+
+# Keep docs
+!README.md
+!docs.md
+!terse-docs.md

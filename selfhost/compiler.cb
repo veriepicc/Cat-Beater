@@ -1,0 +1,475 @@
+; Self-hosted tiny compiler in CatBeater (minimal subset)
+; Compiles a tiny English CatBeater program to bytecode (.cat) and writes it
+
+; ===== Lexer =====
+define function is_alpha with parameters c returning number: do
+  let o be ord of c
+  (o >= ord of "A" and o <= ord of "Z") or (o >= ord of "a" and o <= ord of "z") or (c == "_")
+end
+
+define function is_digit with parameters c returning number: do
+  let o be ord of c
+  o >= ord of "0" and o <= ord of "9"
+end
+
+define function is_alnum with parameters c returning number: do
+  is_alpha(c) or is_digit(c)
+end
+
+define function is_space with parameters c returning number: do
+  c == " " or c == "\t" or c == "\r"
+end
+
+define function mk_tok with parameters ty, lx, ln, cl returning number: do
+  let m be new map
+  set key "type" of m to ty
+  set key "lex" of m to lx
+  set key "line" of m to ln
+  set key "col" of m to cl
+  m
+end
+
+define function add_tok with parameters toks, ty, lx, ln, cl returning number: do
+  append mk_tok(ty, lx, ln, cl) to toks
+end
+
+define function lex with parameters source returning number: do
+  let toks be []
+  let i be 0
+  let n be length of source
+  let line be 1
+  let col be 1
+  while i < n do do
+    let ch be char at i in source
+    if is_space(ch) then do set i to i + 1 set col to col + 1 continue end
+    if ch == chr 10 then do set i to i + 1 set line to line + 1 set col to 1 continue end
+    if ch == ";" or ch == "#" then do while i < n and not (char at i in source == chr 10) do set i to i + 1 set col to col + 1 end continue end
+    let startLine be line
+    let startCol be col
+    if ch == chr 34 then do
+      set i to i + 1
+      set col to col + 1
+      let j be i
+      while j < n and not (char at j in source == chr 34) and not (char at j in source == chr 10) do set j to j + 1 end
+      if j >= n or char at j in source == chr 10 then do add_tok(toks, "ERROR", "unterminated string", startLine, startCol) break end
+      let raw be substring of source from i - 1 to j + 1
+      while i <= j do set i to i + 1 set col to col + 1 end
+      add_tok(toks, "STRING", raw, startLine, startCol)
+      continue
+    end
+    if is_digit(ch) then do
+      let j be i
+      while j < n and is_digit(char at j in source) do set j to j + 1 end
+      if j < n and char at j in source == "." then do set j to j + 1 while j < n and is_digit(char at j in source) do set j to j + 1 end end
+      let lx be substring of source from i to j
+      while i < j do set i to i + 1 set col to col + 1 end
+      add_tok(toks, "NUMBER", lx, startLine, startCol)
+      continue
+    end
+    if is_alpha(ch) then do
+      let j be i
+      while j < n and is_alnum(char at j in source) do set j to j + 1 end
+      let lx be substring of source from i to j
+      while i < j do set i to i + 1 set col to col + 1 end
+      if lx == "print" or lx == "let" or lx == "be" or lx == "to" then do
+        add_tok(toks, "KW", lx, startLine, startCol)
+      end else do
+        add_tok(toks, "IDENT", lx, startLine, startCol)
+      end
+      continue
+    end
+    if ch == "," then do set i to i + 1 add_tok(toks, "COMMA", ",", startLine, startCol) set col to col + 1 continue end
+    if ch == "+" then do set i to i + 1 add_tok(toks, "PLUS", "+", startLine, startCol) set col to col + 1 continue end
+    if ch == "-" then do set i to i + 1 add_tok(toks, "MINUS", "-", startLine, startCol) set col to col + 1 continue end
+    if ch == "*" then do set i to i + 1 add_tok(toks, "STAR", "*", startLine, startCol) set col to col + 1 continue end
+    if ch == "/" then do set i to i + 1 add_tok(toks, "SLASH", "/", startLine, startCol) set col to col + 1 continue end
+    if ch == "(" then do set i to i + 1 add_tok(toks, "LPAREN", "(", startLine, startCol) set col to col + 1 continue end
+    if ch == ")" then do set i to i + 1 add_tok(toks, "RPAREN", ")", startLine, startCol) set col to col + 1 continue end
+    add_tok(toks, "ERROR", concat "unexpected '" and ch, startLine, startCol)
+    set i to i + 1
+    set col to col + 1
+  end end
+  toks
+end
+
+; ===== AST makers =====
+define function mk_node_num with parameters v returning number: do let m be new map set key "kind" of m to "num" set key "value" of m to v m end
+define function mk_node_str with parameters v returning number: do let m be new map set key "kind" of m to "str" set key "value" of m to v m end
+define function mk_node_ident with parameters n returning number: do let m be new map set key "kind" of m to "ident" set key "name" of m to n m end
+define function mk_node_bin with parameters op, l, r returning number: do let m be new map set key "kind" of m to "bin" set key "op" of m to op set key "left" of m to l set key "right" of m to r m end
+define function mk_stmt_print with parameters args returning number: do let m be new map set key "kind" of m to "print" set key "args" of m to args m end
+define function mk_stmt_let with parameters name, expr returning number: do let m be new map set key "kind" of m to "let" set key "name" of m to name set key "expr" of m to expr m end
+
+; ===== Parser =====
+define function tok_type with parameters toks, i returning number: do let t be toks[i] get "type" from t end
+define function tok_lex with parameters toks, i returning number: do let t be toks[i] get "lex" from t end
+
+define function parse_primary with parameters toks, i returning number: do
+  if i >= length of toks then do
+    let m be new map
+    set key "kind" of m to "num"
+    set key "value" of m to 0
+    return [ m, i ]
+  end
+  let tt be toks[i]
+  let ty be get "type" from tt
+  if ty == "NUMBER" then do
+    let lx be get "lex" from tt
+    let n be parse float lx
+    let m be new map
+    set key "kind" of m to "num"
+    set key "value" of m to n
+    return [ m, i + 1 ]
+  end
+  if ty == "STRING" then do
+    let raw be get "lex" from tt
+    let s be substring of raw from 1 to length of raw - 1
+    let m be new map
+    set key "kind" of m to "str"
+    set key "value" of m to s
+    return [ m, i + 1 ]
+  end
+  if ty == "IDENT" then do
+    let m be new map
+    set key "kind" of m to "ident"
+    set key "name" of m to get "lex" from tt
+    return [ m, i + 1 ]
+  end
+  if ty == "LPAREN" then do let p be parse_expression(toks, i + 1) let node be p[0] let j be p[1] if j < length of toks and (get "type" from toks[j]) == "RPAREN" then return [ node, j + 1 ] end return [ node, j ] end
+  let m be new map
+  set key "kind" of m to "num"
+  set key "value" of m to 0
+  [ m, i + 1 ]
+end
+
+define function parse_factor with parameters toks, i returning number: do
+  let p be parse_primary(toks, i)
+  let left be p[0]
+  let j be p[1]
+  while j < length of toks and ((get "type" from toks[j]) == "STAR" or (get "type" from toks[j]) == "SLASH") do
+    let op be get "lex" from toks[j]
+    let rp be parse_primary(toks, j + 1)
+    let r be rp[0]
+    set j to rp[1]
+    let bn be new map
+    set key "kind" of bn to "bin"
+    set key "op" of bn to op
+    set key "left" of bn to left
+    set key "right" of bn to r
+    set left to bn
+  end
+  [ left, j ]
+end
+
+define function parse_term with parameters toks, i returning number: do
+  let p be parse_factor(toks, i)
+  let left be p[0]
+  let j be p[1]
+  while j < length of toks and ((get "type" from toks[j]) == "PLUS" or (get "type" from toks[j]) == "MINUS") do
+    let op be get "lex" from toks[j]
+    let rp be parse_factor(toks, j + 1)
+    let r be rp[0]
+    set j to rp[1]
+    let bn be new map
+    set key "kind" of bn to "bin"
+    set key "op" of bn to op
+    set key "left" of bn to left
+    set key "right" of bn to r
+    set left to bn
+  end
+  [ left, j ]
+end
+
+define function parse_expression with parameters toks, i returning number: do
+  parse_term(toks, i)
+end
+
+define function parse_stmt_line with parameters line returning number: do
+  let toks be lex(line)
+  if length of toks == 0 then return nil end
+  if (get "type" from toks[0]) == "KW" and (get "lex" from toks[0]) == "print" then do
+    let args be []
+    let i be 1
+    while i < length of toks do
+      let pair be parse_expression(toks, i)
+      append pair[0] to args
+      set i to pair[1]
+      if i < length of toks and tok_type(toks, i) == "COMMA" then set i to i + 1 else break end
+    end
+    let sm be new map
+    set key "kind" of sm to "print"
+    set key "args" of sm to args
+    return sm
+  end
+  if (get "type" from toks[0]) == "KW" and (get "lex" from toks[0]) == "let" then do
+    if length of toks < 4 then do let em be new map set key "kind" of em to "print" set key "args" of em to [] return em end
+    if (get "type" from toks[1]) != "IDENT" then do let em2 be new map set key "kind" of em2 to "print" set key "args" of em2 to [] return em2 end
+    if (get "type" from toks[2]) != "KW" or (get "lex" from toks[2]) != "be" then do let em3 be new map set key "kind" of em3 to "print" set key "args" of em3 to [] return em3 end
+    let name be get "lex" from toks[1]
+    let pair be parse_expression(toks, 3)
+    let sm be new map
+    set key "kind" of sm to "let"
+    set key "name" of sm to name
+    set key "expr" of sm to pair[0]
+    return sm
+  end
+  let sm4 be new map
+  set key "kind" of sm4 to "print"
+  let zero be new map
+  set key "kind" of zero to "num"
+  set key "value" of zero to 0
+  let al be []
+  append zero to al
+  set key "args" of sm4 to al
+  sm4
+end
+
+define function parse_program with parameters source returning number: do
+  let lines be split source by "\n"
+  let i be 0
+  let out be []
+  while i < length of lines do
+    let ln be trim lines[i]
+    if ln != "" and not (ln == ";" or ln == "#") then do
+      let stmt be parse_stmt_line(ln)
+      if stmt != nil then append stmt to out end
+    end
+    set i to i + 1
+  end
+  out
+end
+
+; ===== Chunk building helpers =====
+define function emit_u8 with parameters b, buf returning number: do concat buf and chr b end
+define function emit_u16 with parameters v, buf returning number: do concat buf and pack16 v end
+define function emit_u32 with parameters v, buf returning number: do concat buf and pack32 v end
+define function emit_f64 with parameters d, buf returning number: do concat buf and pack64 d end
+define function emit_str with parameters s, buf returning number: do concat (emit_u32(length of s, buf)) and s end
+
+; Global state for codegen
+let g_consts be []
+let g_constKinds be []
+let g_cmap be new map
+let g_names be []
+let g_nmap be new map
+
+; constants and names tables (maps -> indices)
+define function add_const_num with parameters v returning number: do
+  let key be concat "N:" and tostring v
+  if has key in g_cmap then return get key from g_cmap end
+  append v to g_consts
+  append 1 to g_constKinds
+  let idx be length of g_consts - 1
+  set key key of g_cmap to idx
+  idx
+end
+
+define function add_const_str with parameters s returning number: do
+  let key be concat "S:" and s
+  if has key in g_cmap then return get key from g_cmap end
+  append s to g_consts
+  append 2 to g_constKinds
+  let idx be length of g_consts - 1
+  set key key of g_cmap to idx
+  idx
+end
+
+define function add_name with parameters s returning number: do
+  if has s in g_nmap then return get s from g_nmap end
+  append s to g_names
+  let idx be length of g_names - 1
+  set key s of g_nmap to idx
+  idx
+end
+
+; ===== Codegen (expr/print/let) =====
+; OpCode constants (must match src/IR.ixx)
+let OP_CONST be 0
+let OP_GET_GLOBAL be 1
+let OP_SET_GLOBAL be 2
+let OP_PRINT be 81
+let OP_ADD be 10
+let OP_SUB be 11
+let OP_MUL be 12
+let OP_DIV be 13
+let OP_HALT be 83
+
+; small helpers to stay within simple expression forms
+define function cat2 with parameters a, b returning number: return concat a and b end
+define function cat_byte with parameters s, b returning number: return concat s and chr b end
+
+define function gen_expr with parameters node returning number: do
+  let k be get "kind" from node
+  if k == "num" then do
+    let idx be add_const_num(get "value" from node)
+    return concat chr OP_CONST and pack16 idx
+  end
+  if k == "str" then do
+    let idx be add_const_str(get "value" from node)
+    return concat chr OP_CONST and pack16 idx
+  end
+  if k == "ident" then do
+    let name be get "name" from node
+    let ni be add_name(name)
+    return concat chr OP_GET_GLOBAL and pack16 ni
+  end
+  if k == "bin" then do
+    let code be gen_expr(get "left" from node)
+    let code2 be gen_expr(get "right" from node)
+    let op be get "op" from node
+    let opc be OP_ADD
+    if op == "+" then set opc to OP_ADD end
+    if op == "-" then set opc to OP_SUB end
+    if op == "*" then set opc to OP_MUL end
+    if op == "/" then set opc to OP_DIV end
+    ; build combined in a single expression to satisfy statement parser
+    set code to cat2(code, code2)
+    set code to cat_byte(code, opc)
+    return code
+  end
+  ""
+end
+
+define function gen_stmt with parameters stmt returning number: do
+  let k be get "kind" from stmt
+  if k == "print" then do
+    let args be get "args" from stmt
+    let i be 0
+    let code be ""
+    while i < length of args do
+      let piece be gen_expr(args[i])
+      set code to concat code and piece
+      set i to i + 1
+    end
+    set code to concat code and chr(OP_PRINT)
+    set code to concat code and chr(length of args)
+    return code
+  end
+  if k == "let" then do
+    let name be get "name" from stmt
+    let exprCode be gen_expr(get "expr" from stmt)
+    let ni be add_name(name)
+    let code be concat exprCode and chr OP_SET_GLOBAL
+    set code to concat code and pack16 ni
+    return code
+  end
+  ""
+end
+
+define function write_chunk with parameters code, consts, constKinds, names, outPath returning number: do
+  let buf be ""
+  ; MAGIC 'CBBC' and VERSION=1
+  set buf to emit_u32(0x43424243, buf)
+  set buf to concat buf and pack16 1
+  ; constants
+  set buf to emit_u32(length of consts, buf)
+  let i be 0
+  while i < length of consts do
+    let v be consts[i]
+    let kind be constKinds[i]
+    if kind == 1 then do
+      set buf to concat buf and chr 1
+      set buf to emit_f64(v, buf)
+    end else do
+      set buf to concat buf and chr 2
+      set buf to emit_str(v, buf)
+    end
+    set i to i + 1
+  end
+  ; names
+  set buf to emit_u32(length of names, buf)
+  let j be 0
+  while j < length of names do
+    set buf to emit_str(names[j], buf)
+    set j to j + 1
+  end
+  ; functions table = 0
+  set buf to emit_u32(0, buf)
+  ; code
+  set buf to emit_u32(length of code, buf)
+  set buf to concat buf and code
+  ; debug lines/cols = 0
+  set buf to emit_u32(0, buf)
+  set buf to emit_u32(0, buf)
+  write buf to file outPath
+end
+
+; Minimal fixed chunk writer: print one message and halt
+define function write_minimal_print with parameters msg, outPath returning number: do
+  ; load opcode ids
+  let opc be new map
+  let raw be read file "selfhost/opcodes.txt"
+  if raw != nil then do
+    let lines be split raw by "\n"
+    let i be 0
+    while i < length of lines do
+      let ln be lines[i]
+      if ln != "" then do
+        let parts be split ln by "="
+        if length of parts == 2 then do
+          set key (trim parts[0]) of opc to parse int (trim parts[1])
+        end
+      end
+      set i to i + 1
+    end
+  end
+  let OP_CONST_ID be get "OP_CONST" from opc
+  let OP_PRINT_ID be get "OP_PRINT" from opc
+  let OP_HALT_ID be get "OP_HALT" from opc
+  let buf be ""
+  set buf to emit_u32(0x43424243, buf)
+  set buf to concat buf and pack16 1
+  ; constants: 1 string
+  set buf to emit_u32(1, buf)
+  set buf to concat buf and chr 2
+  set buf to emit_str(msg, buf)
+  ; names: 0
+  set buf to emit_u32(0, buf)
+  ; functions: 0
+  set buf to emit_u32(0, buf)
+  ; code: OP_CONST 0, OP_PRINT 1, OP_HALT
+  let code be ""
+  set code to concat code and chr OP_CONST_ID
+  set code to concat code and pack16 0
+  set code to concat code and chr OP_PRINT_ID
+  set code to concat code and chr 1
+  set code to concat code and chr OP_HALT_ID
+  set buf to emit_u32(length of code, buf)
+  set buf to concat buf and code
+  ; debug: none
+  set buf to emit_u32(0, buf)
+  set buf to emit_u32(0, buf)
+  write buf to file outPath
+  true
+end
+
+define function compile_source_to_cat with parameters source, outPath returning number: do
+  let stmts be parse_program(source)
+  set g_consts to []
+  set g_constKinds to []
+  set g_cmap to new map
+  set g_names to []
+  set g_nmap to new map
+  let code be ""
+  let i be 0
+  while i < length of stmts do
+    let s be gen_stmt(stmts[i])
+    set code to concat code and s
+    set i to i + 1
+  end
+  set code to concat code and chr(OP_HALT)
+  if length of code > 0 then write_chunk(code, g_consts, g_constKinds, g_names, outPath) end
+  true
+end
+
+define function main_compile with parameters inPath, outPath returning number: do
+  ; For now, write a minimal valid chunk to prove the pipeline end-to-end
+  let ok be write_minimal_print("Hello from selfhost!", outPath)
+  if ok then print concat "[compiler] wrote bytecode: " and outPath end
+  ok
+end
+
+; Default demo entry
+main_compile("selfhost/demo.cb", "selfhost/demo.cat")
+
+

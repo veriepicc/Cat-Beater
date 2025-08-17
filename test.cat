@@ -1,0 +1,258 @@
+; CatBeater English demo
+print "Calculator ready:"
+
+; Auto-fix demo (intentional mistakes)
+band 1 1
+bor 0 8
+bxor 5 5
+shl 2 3
+shr 32 1
+call add 2, 3
+replace "ababa" "a" ":"
+let m be new map
+set key "y" of m 99
+set a[0] 1
+call add 5, 7
+band 10 12
+bor 1 2
+bxor 3 2
+shl 8 2
+shr 64 2
+
+; Math
+3+1
+add 2 and 5
+subtract 2 from 9
+(2+3)*4
+10 % 3
+floor 3.7
+ceil 3.1
+round 2.6
+sqrt 9
+abs -5
+pow 2 by 8
+band 6 3
+bor 4 and 1
+bxor 5 and 2
+shl 1 by 4
+shr 16 by 2
+
+; Comparisons
+7 > 3
+3 <= 3
+
+; Printing
+print "hello"
+print true false
+print "multiple words ok"
+print "and/or test:" 1>0 and 2>1
+
+; Variables
+let x be 10
+x+2
+set x to 20
+x
+
+; Arrays
+let a be [1, 2, 3]
+print a[0] a[1] a[2]
+set a[1] to 42
+append 4 to a
+print a[0] a[1] a[2] a[3]
+len a
+reserve a by 16
+clear a
+len a
+
+; Function block body
+define function add with parameters a, b returning number: do
+  let s be a + b
+  s
+end
+print add(2, 3)
+
+; === Concise syntax tests (C-like forms) ===
+; These should produce identical results to the English forms above
+
+// C-style comments work
+/* Block comments 
+   also work */
+
+// Print function call
+print("hello from concise syntax");
+
+// Variables and assignment  
+let y = 7;
+y = y + 1;
+print(y);
+
+// Conditional with logical operators
+if (1 == 1 && 2 > 1) {
+    print("concise if works");
+} else {
+    print("should not see this");
+}
+
+// While loop
+let countdown = 3;
+while (countdown > 0) {
+    print("countdown:", countdown);
+    countdown = countdown - 1;
+}
+
+// Function definition with return
+fn add2(a, b) {
+    return a + b;
+}
+print("add2(3, 4) =", add2(3, 4));
+
+// Function without explicit return (last expression)
+fn multiply(x, y) {
+    x * y;
+}
+print("multiply(5, 6) =", multiply(5, 6));
+
+// Mixed expressions with && and ||
+if (true && false || true) {
+    print("logical operators work");
+}
+
+; Strings / maps / file I/O smoke
+print "=== strings/maps/file io smoke ==="
+let s be "hello,world,catbeater"
+print char at 1 in s
+print substring of s from 0 to 5
+print find "world" in s
+print ord of "A" chr 66
+print split s by ","
+let m be new map
+set key "x" of m to 42
+print get "x" from m has "x" in m does m have "y"
+write "hi" to file "tmp.out"
+print read file "tmp.out"
+
+; Packing and helpers
+print pack16 513 pack32 65537
+print pack64 1.5
+assert 1 == 1
+print concat "a" and "b"
+print trim "  hi  "
+print replace "a_b_a" "_" with ":"
+print join [1,2,3] by ","
+print parse int "123" parse float "1.25"
+print starts with "hel" in "hello" ends with "llo" in "hello"
+let m2 be new map
+set key "a" of m2 to 1
+set key "b" of m2 to 2
+print keys of m2
+print delete key "a" from m2
+print keys of m2
+print exists file "tmp.out"
+
+; Memory demo
+let p be alloc 8
+write8 65 to p at 0
+write8 66 to p at 1
+print read8 p at 0 read8 p at 1
+let q be ptradd p by 4
+write32 0x11223344 to p at 4
+print read32 p at 4
+free p
+
+; Extended memory demo
+let b be alloc 32
+write16 0xBEEF to b at 0
+write32 0xAABBCCDD to b at 2
+write64 0x1122334455667788 to b at 6
+writef32 3.5 to b at 14
+print read16 b at 0 read32 b at 2 read64 b at 6 readf32 b at 14
+let c be alloc 32
+memset c 255 8
+memcpy (ptradd c by 8) (ptradd b by 0) 8
+print read16 c at 0 read16 c at 2 read16 c at 8 read16 c at 10
+print blocksize b ptroffset (ptradd b by 4) ptrblock b
+print ptrdiff b (ptradd b by 16)
+set b to realloc b 48
+print blocksize b
+free b
+
+; If/While blocks
+if 1 == 1 then do
+  print "inside then block"  
+  set x to 99
+end else do
+  print "inside else block"
+end end
+
+while x > 95 do do
+  print x
+  set x to x - 1
+end end
+
+; If
+if 7 > 3 then print "then" else print "else" end
+
+; While (single-statement body)
+let n be 3
+while n > 0 do set n to n - 1 end
+print n
+
+; Functions
+; Strings and maps
+print tostring 123
+let m be new map
+set key "x" of m to 42
+print size of m
+clear map m
+print size of m
+define function add with parameters a, b returning number: do
+  let s be a + b
+  s
+end
+print add(2, 3)
+
+; === Concise syntax tests (C-like forms) ===
+; These should produce identical results to the English forms above
+
+// C-style comments work
+/* Block comments 
+   also work */
+
+// Print function call
+print("hello from concise syntax");
+
+// Variables and assignment  
+let y = 7;
+y = y + 1;
+print(y);
+
+// Conditional with logical operators
+if (1 == 1 && 2 > 1) {
+    print("concise if works");
+} else {
+    print("should not see this");
+}
+
+// While loop
+let countdown = 3;
+while (countdown > 0) {
+    print("countdown:", countdown);
+    countdown = countdown - 1;
+}
+
+// Function definition with return
+fn add2(a, b) {
+    return a + b;
+}
+print("add2(3, 4) =", add2(3, 4));
+
+// Function without explicit return (last expression)
+fn multiply(x, y) {
+    x * y;
+}
+print("multiply(5, 6) =", multiply(5, 6));
+
+// Mixed expressions with && and ||
+if (true && false || true) {
+    print("logical operators work");
+}

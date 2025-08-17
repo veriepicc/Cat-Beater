@@ -1,0 +1,326 @@
+; Minimal CatBeater lexer (tiny step)
+; Outputs tokens as maps: { type, lex, line, col }
+
+define function is_alpha with parameters c returning number: do
+  let o be ord of c
+  (o >= ord of "A" and o <= ord of "Z") or (o >= ord of "a" and o <= ord of "z") or (c == "_")
+end
+
+define function is_digit with parameters c returning number: do
+  let o be ord of c
+  o >= ord of "0" and o <= ord of "9"
+end
+
+define function is_alnum with parameters c returning number: do
+  is_alpha(c) or is_digit(c)
+end
+
+define function is_space with parameters c returning number: do
+  c == " " or c == "\t" or c == "\r"
+end
+
+define function mk_tok with parameters ty, lx, ln, cl returning number: do
+  let m be new map
+  set key "type" of m to ty
+  set key "lex" of m to lx
+  set key "line" of m to ln
+  set key "col" of m to cl
+  m
+end
+
+define function add_tok with parameters toks, ty, lx, ln, cl returning number: do
+  append mk_tok(ty, lx, ln, cl) to toks
+end
+
+define function lex with parameters source returning number: do
+  let toks be []
+  let i be 0
+  let n be length of source
+  let line be 1
+  let col be 1
+
+  while i < n do do
+    let ch be char at i in source
+    ; skip whitespace
+    if is_space(ch) then do set i to i + 1 set col to col + 1 continue end
+    if ch == chr 10 then do set i to i + 1 set line to line + 1 set col to 1 continue end
+
+    ; comments starting with ';' or '#'
+    if ch == ";" or ch == "#" then do
+      while i < n and not (char at i in source == chr 10) do set i to i + 1 set col to col + 1 end
+      continue
+    end
+
+    let startLine be line
+    let startCol be col
+
+    ; string literal
+    if ch == chr 34 then do
+      ; consume opening quote
+      set i to i + 1
+      set col to col + 1
+      let j be i
+      while j < n and not (char at j in source == chr 34) and not (char at j in source == chr 10) do set j to j + 1 end
+      if j >= n or char at j in source == chr 10 then do
+        add_tok(toks, "ERROR", "unterminated string", startLine, startCol)
+        break
+      end
+      ; capture raw lexeme including quotes
+      let raw be substring of source from i - 1 to j + 1
+      ; consume through closing quote
+      while i <= j do set i to i + 1 set col to col + 1 end
+      add_tok(toks, "STRING", raw, startLine, startCol)
+      continue
+    end
+
+    ; number literal
+    if is_digit(ch) then do
+      let j be i
+      while j < n and is_digit(char at j in source) do set j to j + 1 end
+      if j < n and char at j in source == "." then do
+        set j to j + 1
+        while j < n and is_digit(char at j in source) do set j to j + 1 end
+      end
+      let lx be substring of source from i to j
+      ; advance i to j while updating col/line
+      while i < j do set i to i + 1 set col to col + 1 end
+      add_tok(toks, "NUMBER", lx, startLine, startCol)
+      continue
+    end
+
+    ; identifier / keyword
+    if is_alpha(ch) then do
+      let j be i
+      while j < n and is_alnum(char at j in source) do set j to j + 1 end
+      let lx be substring of source from i to j
+      while i < j do set i to i + 1 set col to col + 1 end
+      if lx == "print" or lx == "let" or lx == "be" or lx == "set" or lx == "to" then do
+        add_tok(toks, "KW", lx, startLine, startCol)
+      end else do
+        add_tok(toks, "IDENT", lx, startLine, startCol)
+      end
+      continue
+    end
+
+    ; symbols
+    if ch == "(" then do set i to i + 1 add_tok(toks, "LPAREN", "(", startLine, startCol) set col to col + 1 continue end
+    if ch == ")" then do set i to i + 1 add_tok(toks, "RPAREN", ")", startLine, startCol) set col to col + 1 continue end
+    if ch == "," then do set i to i + 1 add_tok(toks, "COMMA", ",", startLine, startCol) set col to col + 1 continue end
+    if ch == "+" then do set i to i + 1 add_tok(toks, "PLUS", "+", startLine, startCol) set col to col + 1 continue end
+    if ch == "-" then do set i to i + 1 add_tok(toks, "MINUS", "-", startLine, startCol) set col to col + 1 continue end
+    if ch == "*" then do set i to i + 1 add_tok(toks, "STAR", "*", startLine, startCol) set col to col + 1 continue end
+    if ch == "/" then do set i to i + 1 add_tok(toks, "SLASH", "/", startLine, startCol) set col to col + 1 continue end
+    if ch == "[" then do set i to i + 1 add_tok(toks, "LBRACK", "[", startLine, startCol) set col to col + 1 continue end
+    if ch == "]" then do set i to i + 1 add_tok(toks, "RBRACK", "]", startLine, startCol) set col to col + 1 continue end
+    if ch == "=" then do
+      set i to i + 1
+      set col to col + 1
+      add_tok(toks, "EQUAL", "=", startLine, startCol)
+      continue
+    end
+
+    ; unknown char: emit as ERROR and advance
+    add_tok(toks, "ERROR", concat "unexpected '" and ch, startLine, startCol)
+    set i to i + 1
+    set col to col + 1
+  end end
+
+  toks
+end
+
+; tiny demo
+let sample be "print 1, 2+3\nlet x be 3\nprint x * 2"
+
+; ===== AST node constructors (maps) =====
+define function mk_node_num with parameters v returning number: do let m be new map set key "kind" of m to "num" set key "value" of m to v m end
+define function mk_node_str with parameters v returning number: do let m be new map set key "kind" of m to "str" set key "value" of m to v m end
+define function mk_node_ident with parameters n returning number: do let m be new map set key "kind" of m to "ident" set key "name" of m to n m end
+define function mk_node_bin with parameters op, l, r returning number: do let m be new map set key "kind" of m to "bin" set key "op" of m to op set key "left" of m to l set key "right" of m to r m end
+define function mk_node_err with parameters msg returning number: do let m be new map set key "kind" of m to "error" set key "msg" of m to msg m end
+
+; ===== Minimal expression parser (tiny step) =====
+define function tok_type with parameters toks, i returning number: do
+  let t be toks[i]
+  get "type" from t
+end
+define function tok_lex with parameters toks, i returning number: do
+  let t be toks[i]
+  get "lex" from t
+end
+
+define function parse_primary with parameters toks, i returning number: do
+  if i >= length of toks then return [ mk_node_err("eof"), i ] end
+  let ty be tok_type(toks, i)
+  if ty == "NUMBER" then do
+    let lx be tok_lex(toks, i)
+    return [ mk_node_num(parse float lx), i + 1 ]
+  end
+  if ty == "STRING" then do
+    let raw be tok_lex(toks, i)
+    let s be substring of raw from 1 to length of raw - 1
+    return [ mk_node_str(s), i + 1 ]
+  end
+  if ty == "IDENT" then do
+    return [ mk_node_ident(tok_lex(toks, i)), i + 1 ]
+  end
+  if ty == "LPAREN" then do
+    let pair be parse_expression(toks, i + 1)
+    let node be pair[0]
+    let j be pair[1]
+    if j < length of toks and tok_type(toks, j) == "RPAREN" then do
+      return [ node, j + 1 ]
+    end else do
+      return [ mk_node_err(") expected"), j ]
+    end
+  end
+  [ mk_node_err(concat "unexpected " and ty), i + 1 ]
+end
+
+define function parse_factor with parameters toks, i returning number: do
+  let pair be parse_primary(toks, i)
+  let left be pair[0]
+  let j be pair[1]
+  while j < length of toks and (tok_type(toks, j) == "STAR" or tok_type(toks, j) == "SLASH") do
+    let op be tok_lex(toks, j)
+    let rightPair be parse_primary(toks, j + 1)
+    let right be rightPair[0]
+    set j to rightPair[1]
+    set left to mk_node_bin(op, left, right)
+  end
+  [ left, j ]
+end
+
+define function parse_term with parameters toks, i returning number: do
+  let pair be parse_factor(toks, i)
+  let left be pair[0]
+  let j be pair[1]
+  while j < length of toks and (tok_type(toks, j) == "PLUS" or tok_type(toks, j) == "MINUS") do
+    let op be tok_lex(toks, j)
+    let rightPair be parse_factor(toks, j + 1)
+    let right be rightPair[0]
+    set j to rightPair[1]
+    set left to mk_node_bin(op, left, right)
+  end
+  [ left, j ]
+end
+
+define function parse_expression with parameters toks, i returning number: do
+  parse_term(toks, i)
+end
+
+; ===== Tiny evaluator for expressions =====
+define function eval_expr with parameters node, env returning number: do
+  let k be get "kind" from node
+  if k == "num" then return get "value" from node end
+  if k == "str" then return get "value" from node end
+  if k == "ident" then do
+    let name be get "name" from node
+    return get name from env
+  end
+  if k == "bin" then do
+    let op be get "op" from node
+    let l be eval_expr(get "left" from node, env)
+    let r be eval_expr(get "right" from node, env)
+    if op == "+" then return l + r end
+    if op == "-" then return l - r end
+    if op == "*" then return l * r end
+    if op == "/" then return l / r end
+    return nil
+  end
+  nil
+end
+
+; parser demo
+let expr_src be "1+2*3"
+let t2 be lex(expr_src)
+let p2 be parse_expression(t2, 0)
+let ast be p2[0]
+let demo_env be new map
+; debug first token of expr
+if length of t2 > 0 then do
+  print get "type" from t2[0]
+  print get "lex" from t2[0]
+end
+print eval_expr(ast, demo_env)
+
+; ===== Statement layer: print and let =====
+define function mk_stmt_print with parameters args returning number: do
+  let m be new map
+  set key "kind" of m to "print"
+  set key "args" of m to args
+  m
+end
+
+define function mk_stmt_let with parameters name, expr returning number: do
+  let m be new map
+  set key "kind" of m to "let"
+  set key "name" of m to name
+  set key "expr" of m to expr
+  m
+end
+
+define function parse_stmt_line with parameters line returning number: do
+  let toks be lex(line)
+  if length of toks == 0 then return nil end
+  if tok_type(toks, 0) == "KW" and tok_lex(toks, 0) == "print" then do
+    let args be []
+    let i be 1
+    while i < length of toks do
+      let pair be parse_expression(toks, i)
+      append pair[0] to args
+      set i to pair[1]
+      if i < length of toks and tok_type(toks, i) == "COMMA" then set i to i + 1 else break end
+    end
+    return mk_stmt_print(args)
+  end
+  if tok_type(toks, 0) == "KW" and tok_lex(toks, 0) == "let" then do
+    if length of toks < 4 then return mk_node_err("incomplete let") end
+    if tok_type(toks, 1) != "IDENT" then return mk_node_err("identifier expected") end
+    if tok_type(toks, 2) != "KW" or tok_lex(toks, 2) != "be" then return mk_node_err("'be' expected") end
+    let name be tok_lex(toks, 1)
+    let pair be parse_expression(toks, 3)
+    return mk_stmt_let(name, pair[0])
+  end
+  mk_node_err("unknown statement")
+end
+
+define function eval_stmt with parameters stmt, env returning number: do
+  if stmt == nil then return nil end
+  let k be get "kind" from stmt
+  if k == "print" then do
+    let args be get "args" from stmt
+    let i be 0
+    while i < length of args do
+      let v be eval_expr(args[i], env)
+      print v
+      set i to i + 1
+    end
+    return nil
+  end
+  if k == "let" then do
+    let name be get "name" from stmt
+    let v be eval_expr(get "expr" from stmt, env)
+    set key name of env to v
+    return nil
+  end
+  print concat "statement error: " and get "msg" from stmt
+  nil
+end
+
+define function run_lines with parameters source returning number: do
+  let env be new map
+  let lines be split source by "\n"
+  let i be 0
+  while i < length of lines do
+    let ln be lines[i]
+    if trim ln != "" then do
+      let stmt be parse_stmt_line(ln)
+      eval_stmt(stmt, env)
+    end
+    set i to i + 1
+  end
+  true
+end
+
+; run the small sample program
+run_lines(sample)

@@ -1,0 +1,4 @@
+; Tiny program compiled by selfhost compiler
+print "Hello from selfhost!"
+
+
