@@ -1,0 +1,49 @@
+function Trim(s) {
+  return __trim(s);
+}
+function Contains(needle, hay) {
+  return contains(needle, hay);
+}
+function Find(needle, hay) {
+  return __str_find(hay, needle);
+}
+function PadLeft(s, width, ch) {
+  let out = s;
+  while (__len(out) < width) {
+    out = __str_cat(ch, out);
+  }
+  out;
+}
+function PadRight(s, width, ch) {
+  let out = s;
+  while (__len(out) < width) {
+    out = __str_cat(out, ch);
+  }
+  out;
+}
+function Repeat(s, count) {
+  let out = "";
+  let i = 0;
+  while (i < count) {
+    out = __str_cat(out, s);
+    i = i + 1;
+  }
+  out;
+}
+function Join(arr, sep) {
+  return __join(arr, sep);
+}
+function Split(s, sep) {
+  return __split(s, sep);
+}
+function Replace(s, needle, repl) {
+  return __replace(s, needle, repl);
+}
+function StartsWith(s, prefix) {
+  return __starts_with(s, prefix);
+}
+function EndsWith(s, suffix) {
+  return __ends_with(s, suffix);
+}
+
+

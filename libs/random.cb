@@ -1,0 +1,25 @@
+; Simple 32-bit LCG RNG, pure CatBeater (avoid 64-bit precision issues)
+let __rand_state be 2463534242
+
+function Seed(s) {
+  __rand_state = __band(s, 0xFFFFFFFF);
+  true;
+}
+
+function Next() {
+  ; state = (state * 1664525 + 1013904223) mod 2^32
+  __rand_state = __band((__rand_state * 1664525 + 1013904223), 0xFFFFFFFF);
+  __rand_state;
+}
+
+function Float() {
+  Next() / 4294967296; ; [0,1)
+}
+
+function Int(min, max) {
+  let r = Next();
+  let range = max - min + 1;
+  min + (r % range);
+}
+
+

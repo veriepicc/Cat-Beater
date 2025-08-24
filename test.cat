@@ -112,10 +112,43 @@ fn multiply(x, y) {
 }
 print("multiply(5, 6) =", multiply(5, 6));
 
+// Modern concise function alias tests
+function add3(a, b) {
+    return a + b;
+}
+print("add3(10, 20) =", add3(10, 20));
+
+// Last-expression implicit return using 'function'
+function mul3(x, y) {
+    x * y;
+}
+print("mul3(7, 8) =", mul3(7, 8));
+
 // Mixed expressions with && and ||
 if (true && false || true) {
     print("logical operators work");
 }
+
+; === Rich strings & streams ===
+print "=== rich strings & streams ==="
+print upper "hello"
+print lower "HELLO"
+print contains "cat" in "concatenate"
+print format("Hello, {}!", "world")
+
+let fh = fopen("tmp_stream.out", "w");
+fwrite(fh, "line1\n");
+fwrite(fh, "line2\n");
+fclose(fh);
+
+let rh = fopen("tmp_stream.out", "r");
+print freadline(rh)
+print fread(rh, 5)
+fclose(rh)
+
+; stdout/stderr handles (may interleave with normal prints)
+fwrite(stdout(), "STDOUT_OK\n")
+fwrite(stderr(), "STDERR_OK\n")
 
 ; Strings / maps / file I/O smoke
 print "=== strings/maps/file io smoke ==="
@@ -148,6 +181,44 @@ print keys of m2
 print delete key "a" from m2
 print keys of m2
 print exists file "tmp.out"
+
+; === selfhost hello scaffold (concise) ===
+; Build a tiny manifest with raw code: CONST "Hello from selfhost" ; PRINT 1 ; HALT
+let names be []
+let consts be []
+let fns be []
+let dlines be []
+let dcols be []
+
+; Build code bytes by packing integers and concatenating strings
+; OP ids
+let OP_CONST be opcode_id("OP_CONST")
+let OP_PRINT be opcode_id("OP_PRINT")
+let OP_HALT be opcode_id("OP_HALT")
+
+; Add constant index 0 = string
+append "Hello from selfhost" to consts
+
+; code: OP_CONST, u16 idx(0), OP_PRINT, argc(1), OP_HALT
+let code be ""
+code = concat code chr OP_CONST
+code = concat code chr 0
+code = concat code chr 0
+code = concat code chr OP_PRINT
+code = concat code chr 1
+code = concat code chr OP_HALT
+
+; manifest map using new map
+let m3 be new map
+set key "constants" of m3 to consts
+set key "names" of m3 to names
+set key "functions" of m3 to fns
+set key "code" of m3 to code
+set key "debugLines" of m3 to dlines
+set key "debugCols" of m3 to dcols
+
+print emit_chunk m3 "hello.cat"
+print exists file "hello.cat"
 
 ; Memory demo
 let p be alloc 8

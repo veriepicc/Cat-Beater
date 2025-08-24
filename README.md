@@ -29,27 +29,92 @@
 - **Memory (experimental)**: `alloc N`, `free P`, `ptradd P by K`, `read8 P at K`, `write8 V to P at K`, `read32`/`write32`
   - Extended memory/pointers: `read16`/`write16`, `read64`/`write64`, `readf32`/`writef32`, `memcpy DST SRC N`, `memset DST VAL N`, `ptrdiff A B`, `realloc P SIZE`, `blocksize P`, `ptroffset P`, `ptrblock P`
 - **Strings (basic)**: `char at I in S`, `substring of S from A to B`, `find "needle" in S` (index or -1), `ord of "A"`, `chr 65`, `split S by ","`, `tostring X`
+  - Rich strings: `upper("hi")`, `lower("HI")`, `contains("hay", "haystack")`, `format("Hello, {}!", name)`
 - **File I/O**: `read file PATH`, `write DATA to file PATH` (returns true/false)
+  - Streams: `stdin()`, `stdout()`, `stderr()`, `fopen(PATH, MODE)`, `fread(H, N)`, `freadline(H)`, `fwrite(H, DATA)`, `fclose(H)`
 - **Packing and helpers (for self-host)**: `pack16 N`, `pack32 N`, `pack64 N` (f64 LE), `concat A and B`, `trim S`, `replace S X with Y`, `join [..] by SEP`, `assert COND`, `panic MSG`, `exit N`
 - **Math/bitwise**: `floor X`, `ceil X`, `round X`, `sqrt X`, `abs X`, `pow A by B`, `band A and B`, `bor A and B`, `bxor A and B`, `shl A by B`, `shr A by B`
 - **Comments**: Lines starting with `;` or `#` (English), plus `//` and `/* ... */` (concise)
 - **Console**: Runs after the script; type `exit` or `quit` to leave
 
-### 🔥 Dual Syntax Support
+### 🔥 Triple Syntax Support
 
-CatBeater now supports **both English and concise C-like syntax** that can be mixed freely:
+CatBeater now supports **English**, **concise C-like ("rust syntax")**, and **modern concise** that can be mixed freely:
 
-- **Concise**: `fn f(a,b){ return a+b; }`, `if (x>0) { print(x); } else { print(0); }`, `while (n>0) { n = n-1; }`
+- **Concise (classic / "rust syntax")**: `fn f(a,b){ return a+b; }`, `if (x>0) { print(x); } else { print(0); }`, `while (n>0) { n = n - 1; }`
+- **Concise (modern)**: `function f(a, b) { return a + b; }`, arrow form: `function f(a, b) -> a + b;`, terse decl: `x := 10;`, arrow-if: `if (x>0) -> print("pos"); else -> print("neg");`
 - **Blocks**: `{ ... }` with optional `;` separators
 - **Comments**: `// line`, `/* block */`
 - **Logical**: `&&`, `||` in addition to English `and`, `or`
 
+### 📦 Standard Library
+
+CatBeater includes a growing standard library written in pure CatBeater. For detailed documentation on all available modules and functions, see the [Standard Library Reference](libraries.md).
+
+### 🔌 Foreign Function Interface (FFI)
+
+The FFI allows CatBeater to call functions from external C/C++ DLLs. This enables interoperability with system APIs, graphics libraries, and more.
+FFI calls require specifying the DLL name, function name (or ordinal), and a signature string for type marshaling.
+FFI is enabled by default. To disable, set environment variable `CB_ENABLE_FFI=0`.
+
+#### FFI Functions
+
+*   **`__ffi_call(dllName, funcName, ...args)`**
+    Calls a C function from `dllName` by `funcName`. All arguments are treated as 64-bit unsigned integers (`u64`), and the return value is also a `u64`.
+    ```cat
+    print(__ffi_call("kernel32.dll", "GetTickCount"))
+    ```
+
+*   **`__ffi_call_sig(dllName, funcName, signature, ...args)`**
+    Calls a C function with explicit type marshaling. The `signature` string defines return and argument types using a mini-DSL (e.g., "`u32(f64, i32)`").
+    
+    **Supported Types in Signature:** `i32`, `u32`, `i64`, `u64`, `f32`, `f64`, `ptr`, `cstr` (C-style string), `wstr` (Wide string/UTF-16).
+    
+    ```cat
+    ; Call a function returning u32 with no arguments
+    print(__ffi_call_sig("kernel32.dll", "GetCurrentProcessId", "u32()"))
+    
+    ; Call a function with float arguments and float return
+    print(__ffi_call_sig("msvcrt.dll", "pow", "f64(f64,f64)", 2, 3)) ; calculates 2^3
+    
+    ; Call with C-style string
+    print(__ffi_call_sig("msvcrt.dll", "strncmp", "i32(cstr,cstr,i32)", "foo", "foobar", 3))
+    
+    ; Call with Wide (UTF-16) string
+    print(__ffi_call_sig("kernel32.dll", "lstrlenW", "i32(wstr)", "hello"))
+    ```
+
+*   **`__ffi_proc(dllName, funcNameOrOrdinal)`**
+    Retrieves a function pointer (as a `u64` number) for a function in `dllName`. `funcNameOrOrdinal` can be a string (function name) or a number (ordinal).
+    This is useful for obtaining a function pointer once and calling it multiple times without repeated lookups.
+    ```cat
+    ; Get pointer to pow function by name
+    let pPow be __ffi_proc("msvcrt.dll", "pow")
+    
+    ; Get pointer to lstrlenA by name
+    let pLenA be __ffi_proc("kernel32.dll", "lstrlenA")
+    ```
+
+*   **`__ffi_call_ptr(signature, ptr, ...args)`**
+    Calls a function using a previously obtained function `ptr` and a `signature` string for type marshaling.
+    ```cat
+    ; Call pow using the pointer obtained above
+    print(__ffi_call_ptr("f64(f64,f64)", pPow, 2, 4)) ; calculates 2^4
+    
+    ; Call lstrlenA using its pointer
+    print(__ffi_call_ptr("i32(cstr)", pLenA, "abc"))
+    ```
+
+#### C++ Compatibility
+
+CatBeater's FFI aims for robust C-style interoperability. For C++ libraries, direct compatibility is limited:
+
+*   **Supported**: Calling `extern "C"` functions or C++ functions if their names are not mangled (or you provide the exact mangled name) and their signatures exclusively use primitive types (numbers, raw pointers, C-style strings).
+*   **Not Supported (Directly)**: C++ classes, member functions (without manual `this` pointer passing and specific export), templates, standard library types (e.g., `std::string`, `std::vector`), exceptions, and passing complex structs/objects by value. These typically require a C wrapper layer.
+
 ### 🚧 Not Yet Implemented
 
 - Sized integers (`i32/u32`)
-- Rich strings library (beyond basics)
-- Modules/imports
-- I/O streams
 - Concurrency
 
 ## 🚀 Getting Started
@@ -137,6 +202,8 @@ nil == nil             # Nil comparisons
 ```c
 let x = 10;            // Declaration
 x = x + 1;             // Assignment
+// Modern terse decl
+x := 10;
 ```
 
 #### Calls and Printing
@@ -151,6 +218,8 @@ if (x > 0) {           // If statements with braces
 } else {
     print(0);
 }
+// Modern arrow-if
+if (x > 0) -> print("pos"); else -> print("neg");
 ```
 
 #### Loops
@@ -158,17 +227,30 @@ if (x > 0) {           // If statements with braces
 while (n > 0) {        // While loops with braces
     n = n - 1;
 }
+// Modern arrow-while
+while (n > 0) -> (n = n - 1);
 ```
 
 #### Functions
 ```c
-fn add(a, b) {         // Function definitions
+fn add(a, b) {         // Function definitions (classic concise)
     return a + b;
 }
 fn mul(a, b) {         // Last expression returns
     a * b;
 }
+
+// Modern concise alias
+function add2(a, b) {
+    return a + b;
+}
+// Modern arrow function
+function add3(a, b) -> a + b;
 ```
+
+### 🧠 Closures (planned)
+
+Closures and nested lexical scopes will be supported in a future native lowering.
 
 ## 🔄 How Scripts Run
 
@@ -200,6 +282,10 @@ fn mul(a, b) {         // Last expression returns
 - **Milestone 6**: Re-implement compiler in CatBeater, bootstrapped builds
 
 > **Note**: You don't need to make a hardware CPU or real filesystem to self-host. We target our own bytecode VM and use the host OS filesystem via runtime.
+
+## 📚 Standard Library
+
+CatBeater includes a growing standard library written in pure CatBeater. For detailed documentation on all available modules and functions, see the [Standard Library Reference](libraries.md).
 
 ## 📁 Repository Layout
 
@@ -276,12 +362,15 @@ Make CatBeater easy and robust enough to write the CatBeater compiler in CatBeat
 
 ### Run
 ```bash
-# Run source (native)
-CatBeater.exe path\to\program.cb
+# Compile to bytecode (.cat) [default]
+CatBeater.exe path\to\program.cb            # writes path\to\program.cat next to the source
+CatBeater.exe --emit out.cat path\to\program.cb
 
-# Emit + run bytecode
-CatBeater.exe --emit program.cat path\to\program.cb
+# Run bytecode
 CatBeater.exe program.cat
+
+# Bundle a self-contained EXE (optional)
+CatBeater.exe --bundle-exe path\to\program.cb program.exe
 ```
 
 ## 🔬 Self-Host Scaffold (Experimental)

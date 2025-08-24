@@ -1,0 +1,14 @@
+function Stderr(msg) {
+  fwrite(stderr(), msg);
+  return true;
+}
+function Stdout(msg) {
+  fwrite(stdout(), msg);
+  return true;
+}
+function Exit(code) {
+  exit(code);
+  return 0;
+}
+
+

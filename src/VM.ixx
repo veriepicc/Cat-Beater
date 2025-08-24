@@ -12,6 +12,9 @@ import <string>;
 using namespace std::string_literals;
 import <functional>;
 import <cstdlib>;
+import <map>;
+import <cctype>;
+import Bytecode;
 
 export class VM {
 public:
@@ -88,6 +91,8 @@ public:
             if (envVal) { free(envVal); envVal = nullptr; }
         }
 
+        std::map<int, std::shared_ptr<std::fstream>> streams;
+        int nextHandle = 3;
         while (pc < chunk.code.size()) {
             OpCode op = static_cast<OpCode>(chunk.code[pc++]);
             switch (op) {
@@ -343,6 +348,45 @@ public:
                 stack.push_back(as + bs);
                 break;
             }
+            case OpCode::OP_STR_UPPER: {
+                auto sAny = pop(stack);
+                if (sAny.type()!=typeid(std::string)) { stack.push_back(""s); break; }
+                std::string s = std::any_cast<std::string>(sAny);
+                for (char& c : s) c = static_cast<char>(std::toupper((unsigned char)c));
+                stack.push_back(s);
+                break;
+            }
+            case OpCode::OP_STR_LOWER: {
+                auto sAny = pop(stack);
+                if (sAny.type()!=typeid(std::string)) { stack.push_back(""s); break; }
+                std::string s = std::any_cast<std::string>(sAny);
+                for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c));
+                stack.push_back(s);
+                break;
+            }
+            case OpCode::OP_STR_CONTAINS: {
+                auto needleAny = pop(stack);
+                auto hayAny = pop(stack);
+                if (hayAny.type()!=typeid(std::string) || needleAny.type()!=typeid(std::string)) { stack.push_back(false); break; }
+                const std::string& h = std::any_cast<std::string>(hayAny);
+                const std::string& n = std::any_cast<std::string>(needleAny);
+                stack.push_back(h.find(n) != std::string::npos);
+                break;
+            }
+            case OpCode::OP_FORMAT: {
+                std::uint8_t argc = chunk.code[pc++];
+                std::vector<std::any> args; args.reserve(argc+1);
+                for (int i=argc; i>=0; --i) { args.insert(args.begin(), pop(stack)); }
+                if (args[0].type()!=typeid(std::string)) { stack.push_back(""s); break; }
+                std::string fmt = std::any_cast<std::string>(args[0]);
+                std::string out; out.reserve(fmt.size()+argc*4);
+                size_t i=0; int ai=1; while (i<fmt.size()) {
+                    if (fmt[i]=='{' && i+1<fmt.size() && fmt[i+1]=='}' && ai<(int)args.size()) { out += toString(args[ai++]); i+=2; }
+                    else { out.push_back(fmt[i++]); }
+                }
+                stack.push_back(out);
+                break;
+            }
             case OpCode::OP_JOIN: {
                 auto sepAny = pop(stack);
                 auto arrAny = pop(stack);
@@ -577,6 +621,77 @@ public:
                 stack.push_back(ok);
                 break;
             }
+            // Streams
+            case OpCode::OP_STDIN: { stack.push_back(static_cast<double>(0)); break; }
+            case OpCode::OP_STDOUT: { stack.push_back(static_cast<double>(1)); break; }
+            case OpCode::OP_STDERR: { stack.push_back(static_cast<double>(2)); break; }
+            case OpCode::OP_FOPEN: {
+                auto modeAny = pop(stack);
+                auto pathAny = pop(stack);
+                if (pathAny.type()!=typeid(std::string) || modeAny.type()!=typeid(std::string)) { stack.push_back(0.0); break; }
+                const std::string& p = std::any_cast<std::string>(pathAny);
+                const std::string& m = std::any_cast<std::string>(modeAny);
+                std::ios::openmode om = std::ios::binary;
+                if (m.find('r')!=std::string::npos) om |= std::ios::in;
+                if (m.find('w')!=std::string::npos) om |= std::ios::out | std::ios::trunc;
+                if (m.find('a')!=std::string::npos) om |= std::ios::out | std::ios::app;
+                auto fs = std::make_shared<std::fstream>(p, om);
+                if (!fs->is_open()) { stack.push_back(0.0); break; }
+                int h = nextHandle++;
+                streams[h] = fs;
+                stack.push_back(static_cast<double>(h));
+                break;
+            }
+            case OpCode::OP_FCLOSE: {
+                auto hAny = pop(stack);
+                if (hAny.type()!=typeid(double)) { stack.push_back(false); break; }
+                int h = static_cast<int>(std::any_cast<double>(hAny));
+                auto it = streams.find(h);
+                if (it!=streams.end()) { it->second->close(); streams.erase(it); stack.push_back(true); }
+                else { stack.push_back(false); }
+                break;
+            }
+            case OpCode::OP_FREAD: {
+                auto nAny = pop(stack);
+                auto hAny = pop(stack);
+                if (hAny.type()!=typeid(double) || nAny.type()!=typeid(double)) { stack.push_back(""s); break; }
+                int h = static_cast<int>(std::any_cast<double>(hAny));
+                size_t n = static_cast<size_t>(std::max(0.0, std::any_cast<double>(nAny)));
+                if (h==0) { std::string s; s.resize(n); std::cin.read(&s[0], (std::streamsize)n); s.resize((size_t)std::cin.gcount()); stack.push_back(s); break; }
+                auto it = streams.find(h);
+                if (it==streams.end()) { stack.push_back(""s); break; }
+                std::string s; s.resize(n);
+                it->second->read(&s[0], (std::streamsize)n);
+                s.resize((size_t)it->second->gcount());
+                stack.push_back(s);
+                break;
+            }
+            case OpCode::OP_FREADLINE: {
+                auto hAny = pop(stack);
+                if (hAny.type()!=typeid(double)) { stack.push_back(""s); break; }
+                int h = static_cast<int>(std::any_cast<double>(hAny));
+                std::string s;
+                if (h==0) { std::getline(std::cin, s); stack.push_back(s); break; }
+                auto it = streams.find(h);
+                if (it==streams.end()) { stack.push_back(""s); break; }
+                std::getline(*it->second, s);
+                stack.push_back(s);
+                break;
+            }
+            case OpCode::OP_FWRITE: {
+                auto dataAny = pop(stack);
+                auto hAny = pop(stack);
+                if (hAny.type()!=typeid(double) || dataAny.type()!=typeid(std::string)) { stack.push_back(false); break; }
+                int h = static_cast<int>(std::any_cast<double>(hAny));
+                const std::string& data = std::any_cast<std::string>(dataAny);
+                if (h==1) { std::cout << data; stack.push_back(true); break; }
+                if (h==2) { std::cerr << data; stack.push_back(true); break; }
+                auto it = streams.find(h);
+                if (it==streams.end()) { stack.push_back(false); break; }
+                (*it->second) << data;
+                stack.push_back(it->second->good());
+                break;
+            }
             case OpCode::OP_ALLOC: {
                 size_t n = static_cast<size_t>(std::max(0.0, popNum(stack)));
                 auto b = std::make_shared<Block>(); b->data.assign(n, 0);
@@ -700,6 +815,44 @@ public:
                     std::cerr << "[mem] arrays: " << arraysCreated << "/" << arraysDestroyed << ", maps: " << mapsCreated << "/" << mapsDestroyed << "\n";
                 }
                 return 0;
+            }
+            case OpCode::OP_EMIT_CHUNK: {
+                auto pathAny = pop(stack);
+                auto manifestAny = pop(stack);
+                if (pathAny.type()!=typeid(std::string) || manifestAny.type()!=typeid(std::shared_ptr<std::unordered_map<std::string, std::any>>)) { stack.push_back(false); break; }
+                const std::string& outPath = std::any_cast<std::string>(pathAny);
+                using Map = std::unordered_map<std::string, std::any>;
+                auto m = std::any_cast<std::shared_ptr<Map>>(manifestAny);
+                Chunk out;
+                auto getArr = [&](const std::string& key)->std::shared_ptr<std::vector<std::any>>{
+                    auto it = m->find(key); if (it==m->end()) return {};
+                    if (it->second.type()!=typeid(std::shared_ptr<std::vector<std::any>>)) return {};
+                    return std::any_cast<std::shared_ptr<std::vector<std::any>>>(it->second);
+                };
+                if (auto carr = getArr("constants")) { for (const auto& v : *carr) { if (!v.has_value() || v.type()==typeid(std::nullptr_t)) out.constants.push_back(std::monostate{}); else if (v.type()==typeid(double)) out.constants.push_back(std::any_cast<double>(v)); else if (v.type()==typeid(std::string)) out.constants.push_back(std::any_cast<std::string>(v)); else if (v.type()==typeid(bool)) out.constants.push_back(std::any_cast<bool>(v)); } }
+                if (auto narr = getArr("names")) { for (const auto& v : *narr) if (v.type()==typeid(std::string)) out.names.push_back(std::any_cast<std::string>(v)); }
+                if (auto farr = getArr("functions")) {
+                    for (const auto& fnAny : *farr) {
+                        if (fnAny.type()!=typeid(std::shared_ptr<Map>)) continue;
+                        auto fm = std::any_cast<std::shared_ptr<Map>>(fnAny);
+                        std::uint16_t nameIdx = 0, ar = 0; std::uint32_t ent = 0;
+                        auto fnd = fm->find("nameIndex"); if (fnd!=fm->end() && fnd->second.type()==typeid(double)) nameIdx = static_cast<std::uint16_t>(std::any_cast<double>(fnd->second));
+                        fnd = fm->find("arity"); if (fnd!=fm->end() && fnd->second.type()==typeid(double)) ar = static_cast<std::uint16_t>(std::any_cast<double>(fnd->second));
+                        fnd = fm->find("entry"); if (fnd!=fm->end() && fnd->second.type()==typeid(double)) ent = static_cast<std::uint32_t>(std::any_cast<double>(fnd->second));
+                        out.functions.push_back({ nameIdx, ar, ent });
+                    }
+                }
+                {
+                    auto it = m->find("code"); if (it!=m->end() && it->second.type()==typeid(std::string)) { const std::string& raw = std::any_cast<std::string>(it->second); out.code.assign(raw.begin(), raw.end()); }
+                }
+                if (auto dl = getArr("debugLines")) { for (const auto& v : *dl) if (v.type()==typeid(double)) out.debugLines.push_back(static_cast<std::uint32_t>(std::any_cast<double>(v))); }
+                if (auto dc = getArr("debugCols")) { for (const auto& v : *dc) if (v.type()==typeid(double)) out.debugCols.push_back(static_cast<std::uint32_t>(std::any_cast<double>(v))); }
+                std::ofstream ofs(outPath, std::ios::binary);
+                if (!ofs.is_open()) { stack.push_back(false); break; }
+                writeChunk(out, ofs);
+                ofs.flush();
+                stack.push_back(ofs.good());
+                break;
             }
             default: return 1;
             }

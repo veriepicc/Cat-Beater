@@ -1,6 +1,7 @@
 export module NativeExec;
 
 import IR;
+import Bytecode;
 import <vector>;
 import <any>;
 import <string>;
@@ -10,12 +11,32 @@ import <unordered_map>;
 import <fstream>;
 import <functional>;
 import <cstdlib>;
+import <map>;
+import <cctype>;
+import <limits>;
+import <chrono>;
+import FFI;
 
 namespace {
     struct Pointer { int block = -1; size_t offset = 0; };
     struct Block { std::vector<std::uint8_t> data; bool freed=false; };
     static double popNum(std::vector<std::any>& s) {
-        double v = std::any_cast<double>(s.back()); s.pop_back(); return v;
+        if (s.empty()) return 0.0;
+        const std::any& top = s.back();
+        if (top.type() == typeid(double)) { double v = std::any_cast<double>(top); s.pop_back(); return v; }
+        if (top.type() == typeid(bool)) { bool b = std::any_cast<bool>(top); s.pop_back(); return b ? 1.0 : 0.0; }
+        if (top.type() == typeid(std::string)) {
+            const std::string& sv = std::any_cast<const std::string&>(top);
+            s.pop_back();
+            const char* p = sv.c_str();
+            char* endp = nullptr;
+            double v = std::strtod(p, &endp);
+            if (endp == p) return 0.0; // no conversion
+            return v;
+        }
+        // Unknown or null -> 0.0
+        s.pop_back();
+        return 0.0;
     }
     static std::any pop(std::vector<std::any>& s) { auto v = s.back(); s.pop_back(); return v; }
     template<typename F>
@@ -92,7 +113,6 @@ export int runChunk(const Chunk& chunk) {
         }
         return std::string("<val>");
     };
-    auto readU16 = [&](size_t& pc) { std::uint16_t lo = chunk.code[pc++]; std::uint16_t hi = chunk.code[pc++]; return static_cast<std::uint16_t>(lo | (hi << 8)); };
     size_t pc = 0;
     auto reportRuntimeError = [&](const std::string& msg){
         std::uint32_t line = 0;
@@ -106,6 +126,15 @@ export int runChunk(const Chunk& chunk) {
             }
         }
         std::cerr << ": " << msg << "\n";
+    };
+    auto readU8 = [&](size_t& pc)->std::uint8_t {
+        if (pc >= chunk.code.size()) { reportRuntimeError("bytecode truncated reading u8"); pc = chunk.code.size(); return 0; }
+        return chunk.code[pc++];
+    };
+    auto readU16 = [&](size_t& pc)->std::uint16_t {
+        if (pc + 1 >= chunk.code.size()) { reportRuntimeError("bytecode truncated reading u16"); pc = chunk.code.size(); return 0; }
+        std::uint16_t lo = chunk.code[pc++]; std::uint16_t hi = chunk.code[pc++];
+        return static_cast<std::uint16_t>(lo | (hi << 8));
     };
     std::size_t arraysCreated = 0, arraysDestroyed = 0, mapsCreated = 0, mapsDestroyed = 0;
     auto makeArray = [&]() -> std::shared_ptr<std::vector<std::any>> {
@@ -125,17 +154,57 @@ export int runChunk(const Chunk& chunk) {
         if (envVal) { free(envVal); envVal = nullptr; }
     }
 
+    // Simple stream handles: map id -> fstream
+    std::map<int, std::shared_ptr<std::fstream>> streams;
+    int nextHandle = 3; // 0,1,2 reserved for stdio
+
+    // Optional FFI toggle
+    bool ffiEnabled = true;
+    {
+        char* envVal = nullptr; size_t envLen = 0;
+#if defined(_MSC_VER)
+        if (_dupenv_s(&envVal, &envLen, "CB_ENABLE_FFI") == 0 && envVal && envLen > 0 && envVal[0] == '0') ffiEnabled = false;
+#else
+        const char* v = std::getenv("CB_ENABLE_FFI"); if (v && v[0] == '0') ffiEnabled = false;
+#endif
+        if (envVal) { free(envVal); envVal = nullptr; }
+    }
+
+    // Fast xorshift64* PRNG for OP_RANDOM (seeded)
+    unsigned long long rng_state = 0ull;
+    auto mix64 = [](unsigned long long x)->unsigned long long {
+        x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ull;
+        x ^= x >> 27; x *= 0x94d049bb133111ebull;
+        x ^= x >> 31; return x;
+    };
+    {
+        unsigned long long seed = static_cast<unsigned long long>(std::chrono::high_resolution_clock::now().time_since_epoch().count());
+        seed ^= reinterpret_cast<unsigned long long>(&stack);
+        seed ^= reinterpret_cast<unsigned long long>(&globals);
+        seed ^= reinterpret_cast<unsigned long long>(&heap);
+        rng_state = mix64(seed);
+        if (rng_state == 0ull) rng_state = 88172645463393265ull;
+    }
+    auto rng_next = [&](){
+        unsigned long long x = rng_state;
+        x ^= x >> 12; // a
+        x ^= x << 25; // b
+        x ^= x >> 27; // c
+        rng_state = x;
+        return x * 2685821657736338717ull;
+    };
+
     while (pc < chunk.code.size()) {
         OpCode op = static_cast<OpCode>(chunk.code[pc++]);
         switch (op) {
-        case OpCode::OP_JUMP: { std::uint16_t off = readU16(pc); pc += off; break; }
-        case OpCode::OP_JUMP_IF_FALSE: { std::uint16_t off = readU16(pc); const std::any& v = stack.back(); if (!isTruthy(v)) pc += off; break; }
-        case OpCode::OP_LOOP: { std::uint16_t off = readU16(pc); pc -= off; break; }
-        case OpCode::OP_CONST: { std::uint16_t idx = readU16(pc); const auto& v = chunk.constants[idx]; if (std::holds_alternative<double>(v)) stack.push_back(std::get<double>(v)); else if (std::holds_alternative<std::string>(v)) stack.push_back(std::get<std::string>(v)); else if (std::holds_alternative<bool>(v)) stack.push_back(std::get<bool>(v)); else stack.push_back(nullptr); break; }
-        case OpCode::OP_GET_GLOBAL: { std::uint16_t ni = readU16(pc); const std::string& name = chunk.names[ni]; auto it = globals.find(name); if (it == globals.end()) stack.push_back(nullptr); else stack.push_back(it->second); break; }
-        case OpCode::OP_SET_GLOBAL: { std::uint16_t ni = readU16(pc); const std::string& name = chunk.names[ni]; std::any v = stack.back(); stack.pop_back(); globals[name] = v; break; }
-        case OpCode::OP_GET_LOCAL: { std::uint16_t idx = readU16(pc); if (frames.empty() || idx >= frames.back().locals.size()) { stack.push_back(nullptr); } else stack.push_back(frames.back().locals[idx]); break; }
-        case OpCode::OP_SET_LOCAL: { std::uint16_t idx = readU16(pc); std::any v = stack.back(); stack.pop_back(); if (!frames.empty()) { if (idx >= frames.back().locals.size()) frames.back().locals.resize(idx + 1); frames.back().locals[idx] = v; } break; }
+        case OpCode::OP_JUMP: { std::uint16_t off = readU16(pc); if (pc == chunk.code.size()) return 1; pc += off; break; }
+        case OpCode::OP_JUMP_IF_FALSE: { std::uint16_t off = readU16(pc); if (pc == chunk.code.size()) return 1; const std::any& v = stack.back(); if (!isTruthy(v)) pc += off; break; }
+        case OpCode::OP_LOOP: { std::uint16_t off = readU16(pc); if (pc == chunk.code.size()) return 1; pc -= off; break; }
+        case OpCode::OP_CONST: { std::uint16_t idx = readU16(pc); if (pc == chunk.code.size()) return 1; if (idx >= chunk.constants.size()) { reportRuntimeError("const index out of bounds"); return 1; } const auto& v = chunk.constants[idx]; if (std::holds_alternative<double>(v)) stack.push_back(std::get<double>(v)); else if (std::holds_alternative<std::string>(v)) stack.push_back(std::get<std::string>(v)); else if (std::holds_alternative<bool>(v)) stack.push_back(std::get<bool>(v)); else stack.push_back(nullptr); break; }
+        case OpCode::OP_GET_GLOBAL: { std::uint16_t ni = readU16(pc); if (pc == chunk.code.size()) return 1; if (ni >= chunk.names.size()) { reportRuntimeError("global name index out of bounds"); return 1; } const std::string& name = chunk.names[ni]; auto it = globals.find(name); if (it == globals.end()) stack.push_back(nullptr); else stack.push_back(it->second); break; }
+        case OpCode::OP_SET_GLOBAL: { std::uint16_t ni = readU16(pc); if (pc == chunk.code.size()) return 1; if (ni >= chunk.names.size()) { reportRuntimeError("set_global name index out of bounds"); return 1; } const std::string& name = chunk.names[ni]; std::any v = stack.back(); stack.pop_back(); globals[name] = v; break; }
+        case OpCode::OP_GET_LOCAL: { std::uint16_t idx = readU16(pc); if (pc == chunk.code.size()) return 1; if (frames.empty() || idx >= frames.back().locals.size()) { stack.push_back(nullptr); } else stack.push_back(frames.back().locals[idx]); break; }
+        case OpCode::OP_SET_LOCAL: { std::uint16_t idx = readU16(pc); if (pc == chunk.code.size()) return 1; std::any v = stack.back(); stack.pop_back(); if (!frames.empty()) { if (idx >= frames.back().locals.size()) frames.back().locals.resize(idx + 1); frames.back().locals[idx] = v; } break; }
         case OpCode::OP_ADD: binary(stack, [](double a,double b){return a+b;}); break;
         case OpCode::OP_SUB: binary(stack, [](double a,double b){return a-b;}); break;
         case OpCode::OP_MUL: binary(stack, [](double a,double b){return a*b;}); break;
@@ -149,8 +218,8 @@ export int runChunk(const Chunk& chunk) {
         case OpCode::OP_NE: { std::any rb = stack.back(); stack.pop_back(); std::any lb = stack.back(); stack.pop_back(); bool r = equals(lb, rb); stack.push_back(!r); break; }
         case OpCode::OP_AND: { bool b = isTruthy(pop(stack)); bool a = isTruthy(pop(stack)); stack.push_back(a && b); break; }
         case OpCode::OP_OR: { bool b = isTruthy(pop(stack)); bool a = isTruthy(pop(stack)); stack.push_back(a || b); break; }
-        case OpCode::OP_PRINT: { std::uint8_t n = chunk.code[pc++]; std::vector<std::any> args; args.reserve(n); for (int i = 0; i < n; ++i) args.push_back(stack[stack.size() - n + i]); for (int i = 0; i < n; ++i) stack.pop_back(); for (int i = 0; i < n; ++i) { writeAny(args[i]); if (i + 1 < n) std::cout << " "; } std::cout << "\n"; stack.push_back(true); break; }
-        case OpCode::OP_NEW_ARRAY: { std::uint8_t n = chunk.code[pc++]; auto arr = makeArray(); arr->reserve(n); for (int i = n - 1; i >= 0; --i) { arr->insert(arr->begin(), stack.back()); stack.pop_back(); } stack.push_back(arr); break; }
+        case OpCode::OP_PRINT: { std::uint8_t n = readU8(pc); if (pc == chunk.code.size()) return 1; if (stack.size() < n) n = static_cast<std::uint8_t>(stack.size()); if (n == 0) { std::cout << "\n"; break; } std::vector<std::any> args; args.reserve(n); for (int i = 0; i < n; ++i) args.push_back(stack[stack.size() - n + i]); for (int i = 0; i < n; ++i) stack.pop_back(); for (int i = 0; i < n; ++i) { writeAny(args[i]); if (i + 1 < n) std::cout << " "; } std::cout << "\n"; break; }
+        case OpCode::OP_NEW_ARRAY: { std::uint8_t n = readU8(pc); if (pc == chunk.code.size()) return 1; auto arr = makeArray(); arr->reserve(n); for (int i = n - 1; i >= 0; --i) { arr->insert(arr->begin(), stack.back()); stack.pop_back(); } stack.push_back(arr); break; }
         case OpCode::OP_INDEX_GET: { auto idx = popNum(stack); auto anyArr = pop(stack); if (anyArr.type() != typeid(std::shared_ptr<std::vector<std::any>>)) { stack.push_back(nullptr); break; } auto arr = std::any_cast<std::shared_ptr<std::vector<std::any>>>(anyArr); int i = static_cast<int>(idx); if (i < 0 || i >= static_cast<int>(arr->size())) { stack.push_back(nullptr); break; } stack.push_back((*arr)[i]); break; }
         case OpCode::OP_INDEX_SET: { auto val = pop(stack); auto idx = popNum(stack); auto anyArr = pop(stack); if (anyArr.type() != typeid(std::shared_ptr<std::vector<std::any>>)) { stack.push_back(nullptr); break; } auto arr = std::any_cast<std::shared_ptr<std::vector<std::any>>>(anyArr); int i = static_cast<int>(idx); if (i < 0 || i >= static_cast<int>(arr->size())) { stack.push_back(nullptr); break; } (*arr)[i] = val; stack.push_back(nullptr); break; }
         case OpCode::OP_LEN: { auto anyVal = pop(stack); if (anyVal.type() == typeid(std::shared_ptr<std::vector<std::any>>)) { auto arr = std::any_cast<std::shared_ptr<std::vector<std::any>>>(anyVal); stack.push_back(static_cast<double>(arr->size())); } else if (anyVal.type() == typeid(std::string)) { const std::string& s = std::any_cast<std::string>(anyVal); stack.push_back(static_cast<double>(s.size())); } else { stack.push_back(0.0); } break; }
@@ -164,6 +233,14 @@ export int runChunk(const Chunk& chunk) {
         case OpCode::OP_STR_FIND: { auto needleAny = pop(stack); auto hayAny = pop(stack); if (hayAny.type() != typeid(std::string) || needleAny.type() != typeid(std::string)) { stack.push_back(-1.0); break; } const std::string& h = std::any_cast<std::string>(hayAny); const std::string& n = std::any_cast<std::string>(needleAny); size_t pos = h.find(n); if (pos == std::string::npos) stack.push_back(-1.0); else stack.push_back(static_cast<double>(pos)); break; }
         case OpCode::OP_SPLIT: { auto sepAny = pop(stack); auto strAny = pop(stack); if (strAny.type() != typeid(std::string) || sepAny.type() != typeid(std::string)) { stack.push_back(nullptr); break; } const std::string& s = std::any_cast<std::string>(strAny); const std::string& sep = std::any_cast<std::string>(sepAny); auto arr = makeArray(); if (sep.empty()) { arr->reserve(s.size()); for (char c : s) arr->push_back(std::string(1, c)); } else { size_t start = 0; while (true) { size_t pos = s.find(sep, start); if (pos == std::string::npos) { arr->push_back(s.substr(start)); break; } arr->push_back(s.substr(start, pos - start)); start = pos + sep.size(); } } stack.push_back(arr); break; }
         case OpCode::OP_STR_CAT: { auto bAny = pop(stack); auto aAny = pop(stack); std::string as = toString(aAny); std::string bs = toString(bAny); stack.push_back(as + bs); break; }
+        case OpCode::OP_STR_UPPER: { auto sAny = pop(stack); if (sAny.type()!=typeid(std::string)) { stack.push_back(std::string("")); break; } std::string s = std::any_cast<std::string>(sAny); for (char& c : s) c = static_cast<char>(std::toupper((unsigned char)c)); stack.push_back(s); break; }
+        case OpCode::OP_STR_LOWER: { auto sAny = pop(stack); if (sAny.type()!=typeid(std::string)) { stack.push_back(std::string("")); break; } std::string s = std::any_cast<std::string>(sAny); for (char& c : s) c = static_cast<char>(std::tolower((unsigned char)c)); stack.push_back(s); break; }
+        case OpCode::OP_STR_CONTAINS: { auto needleAny = pop(stack); auto hayAny = pop(stack); if (hayAny.type()!=typeid(std::string) || needleAny.type()!=typeid(std::string)) { stack.push_back(false); break; } const std::string& h = std::any_cast<std::string>(hayAny); const std::string& n = std::any_cast<std::string>(needleAny); stack.push_back(h.find(n) != std::string::npos); break; }
+        case OpCode::OP_FORMAT: { std::uint8_t argc = readU8(pc); if (pc == chunk.code.size()) return 1; std::vector<std::any> args; args.reserve(argc+1); for (int i=argc; i>=0; --i) { args.insert(args.begin(), pop(stack)); }
+            if (args[0].type()!=typeid(std::string)) { stack.push_back(std::string("")); break; }
+            std::string fmt = std::any_cast<std::string>(args[0]); std::string out; out.reserve(fmt.size()+argc*4);
+            size_t i=0; int ai=1; while (i<fmt.size()) { if (fmt[i]=='{' && i+1<fmt.size() && fmt[i+1]=='}' && ai<(int)args.size()) { out += toString(args[ai++]); i+=2; } else { out.push_back(fmt[i++]); } }
+            stack.push_back(out); break; }
         case OpCode::OP_JOIN: { auto sepAny = pop(stack); auto arrAny = pop(stack); if (arrAny.type() != typeid(std::shared_ptr<std::vector<std::any>>) || sepAny.type()!=typeid(std::string)) { stack.push_back(std::string("")); break; } auto arr = std::any_cast<std::shared_ptr<std::vector<std::any>>>(arrAny); const std::string& sep = std::any_cast<std::string>(sepAny); std::string s; for (size_t i=0;i<arr->size();++i){ if (i) s.append(sep); s.append(toString((*arr)[i])); } stack.push_back(s); break; }
         case OpCode::OP_TRIM: { auto sAny = pop(stack); if (sAny.type()!=typeid(std::string)) { stack.push_back(std::string("")); break; } const std::string& in = std::any_cast<std::string>(sAny); size_t i=0,j=in.size(); while (i<j && std::isspace((unsigned char)in[i])) ++i; while (j>i && std::isspace((unsigned char)in[j-1])) --j; stack.push_back(in.substr(i, j-i)); break; }
         case OpCode::OP_REPLACE: { auto replAny = pop(stack); auto needleAny = pop(stack); auto sAny = pop(stack); if (sAny.type()!=typeid(std::string) || needleAny.type()!=typeid(std::string) || replAny.type()!=typeid(std::string)) { stack.push_back(std::string("")); break; } std::string s = std::any_cast<std::string>(sAny); const std::string& n = std::any_cast<std::string>(needleAny); const std::string& r = std::any_cast<std::string>(replAny); if (!n.empty()) { size_t pos=0; while ((pos = s.find(n, pos)) != std::string::npos) { s.replace(pos, n.size(), r); pos += r.size(); } } stack.push_back(s); break; }
@@ -181,6 +258,18 @@ export int runChunk(const Chunk& chunk) {
         case OpCode::OP_SQRT: { double a = popNum(stack); stack.push_back(std::sqrt(std::max(0.0, a))); break; }
         case OpCode::OP_ABS: { double a = popNum(stack); stack.push_back(std::fabs(a)); break; }
         case OpCode::OP_POW: { double b = popNum(stack); double a = popNum(stack); stack.push_back(std::pow(a, b)); break; }
+        case OpCode::OP_EXP: { double a = popNum(stack); stack.push_back(std::exp(a)); break; }
+        case OpCode::OP_LOG: { double a = popNum(stack); if (a <= 0.0) { reportRuntimeError("log of non-positive"); stack.push_back(-std::numeric_limits<double>::infinity()); } else { stack.push_back(std::log(a)); } break; }
+        case OpCode::OP_SIN: { double a = popNum(stack); stack.push_back(std::sin(a)); break; }
+        case OpCode::OP_COS: { double a = popNum(stack); stack.push_back(std::cos(a)); break; }
+        case OpCode::OP_TAN: { double a = popNum(stack); stack.push_back(std::tan(a)); break; }
+        case OpCode::OP_ASIN: { double a = popNum(stack); if (a < -1.0 || a > 1.0) { reportRuntimeError("asin domain"); stack.push_back(std::numeric_limits<double>::quiet_NaN()); } else { stack.push_back(std::asin(a)); } break; }
+        case OpCode::OP_ACOS: { double a = popNum(stack); if (a < -1.0 || a > 1.0) { reportRuntimeError("acos domain"); stack.push_back(std::numeric_limits<double>::quiet_NaN()); } else { stack.push_back(std::acos(a)); } break; }
+        case OpCode::OP_ATAN: { double a = popNum(stack); stack.push_back(std::atan(a)); break; }
+        case OpCode::OP_ATAN2: { double x = popNum(stack); double y = popNum(stack); stack.push_back(std::atan2(y, x)); break; }
+        case OpCode::OP_RANDOM: { unsigned long long r = rng_next(); // uniform in [0,1)
+            // Convert to double [0,1): take top 53 bits for mantissa
+            double d = static_cast<double>((r >> 11)) * (1.0/9007199254740992.0); stack.push_back(d); break; }
         case OpCode::OP_BAND: { double b = popNum(stack); double a = popNum(stack); stack.push_back(static_cast<double>((static_cast<std::int64_t>(a)) & (static_cast<std::int64_t>(b)))); break; }
         case OpCode::OP_BOR: { double b = popNum(stack); double a = popNum(stack); stack.push_back(static_cast<double>((static_cast<std::int64_t>(a)) | (static_cast<std::int64_t>(b)))); break; }
         case OpCode::OP_BXOR: { double b = popNum(stack); double a = popNum(stack); stack.push_back(static_cast<double>((static_cast<std::int64_t>(a)) ^ (static_cast<std::int64_t>(b)))); break; }
@@ -201,6 +290,23 @@ export int runChunk(const Chunk& chunk) {
         case OpCode::OP_CHR: { double n = popNum(stack); char c = static_cast<char>(static_cast<int>(n) & 0xFF); stack.push_back(std::string(1, c)); break; }
         case OpCode::OP_READ_FILE: { auto pathAny = pop(stack); if (pathAny.type() != typeid(std::string)) { stack.push_back(std::string("")); break; } const std::string& path = std::any_cast<std::string>(pathAny); std::ifstream ifs(path, std::ios::binary); if (!ifs) { stack.push_back(std::string("")); break; } std::string data((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>()); stack.push_back(data); break; }
         case OpCode::OP_WRITE_FILE: { auto dataAny = pop(stack); auto pathAny = pop(stack); if (pathAny.type() != typeid(std::string) || dataAny.type() != typeid(std::string)) { stack.push_back(false); break; } const std::string& path = std::any_cast<std::string>(pathAny); const std::string& data = std::any_cast<std::string>(dataAny); std::ofstream ofs(path, std::ios::binary); bool ok = false; if (ofs) { ofs.write(data.data(), (std::streamsize)data.size()); ok = ofs.good(); } stack.push_back(ok); break; }
+        // Streams
+        case OpCode::OP_STDIN: { stack.push_back(static_cast<double>(0)); break; }
+        case OpCode::OP_STDOUT: { stack.push_back(static_cast<double>(1)); break; }
+        case OpCode::OP_STDERR: { stack.push_back(static_cast<double>(2)); break; }
+        case OpCode::OP_FOPEN: { auto modeAny = pop(stack); auto pathAny = pop(stack); if (pathAny.type()!=typeid(std::string) || modeAny.type()!=typeid(std::string)) { stack.push_back(0.0); break; } const std::string& p = std::any_cast<std::string>(pathAny); const std::string& m = std::any_cast<std::string>(modeAny); std::ios::openmode om = std::ios::binary; if (m.find('r')!=std::string::npos) om |= std::ios::in; if (m.find('w')!=std::string::npos) om |= std::ios::out | std::ios::trunc; if (m.find('a')!=std::string::npos) om |= std::ios::out | std::ios::app; auto fs = std::make_shared<std::fstream>(p, om); if (!fs->is_open()) { stack.push_back(0.0); break; } int h = nextHandle++; streams[h] = fs; stack.push_back(static_cast<double>(h)); break; }
+        case OpCode::OP_FCLOSE: { auto hAny = pop(stack); if (hAny.type()!=typeid(double)) { stack.push_back(false); break; } int h = static_cast<int>(std::any_cast<double>(hAny)); auto it = streams.find(h); if (it!=streams.end()) { it->second->close(); streams.erase(it); stack.push_back(true); } else { stack.push_back(false); } break; }
+        case OpCode::OP_FREAD: { auto nAny = pop(stack); auto hAny = pop(stack); if (hAny.type()!=typeid(double) || nAny.type()!=typeid(double)) { stack.push_back(std::string("")); break; } int h = static_cast<int>(std::any_cast<double>(hAny)); size_t n = static_cast<size_t>(std::max(0.0, std::any_cast<double>(nAny))); if (h==0) { std::string s; s.resize(n); std::cin.read(&s[0], (std::streamsize)n); s.resize((size_t)std::cin.gcount()); stack.push_back(s); break; } auto it = streams.find(h); if (it==streams.end()) { stack.push_back(std::string("")); break; } std::string s; s.resize(n); it->second->read(&s[0], (std::streamsize)n); s.resize((size_t)it->second->gcount()); stack.push_back(s); break; }
+        case OpCode::OP_FREADLINE: { auto hAny = pop(stack); if (hAny.type()!=typeid(double)) { stack.push_back(std::string("")); break; } int h = static_cast<int>(std::any_cast<double>(hAny)); std::string s; if (h==0) { std::getline(std::cin, s); stack.push_back(s); break; } auto it = streams.find(h); if (it==streams.end()) { stack.push_back(std::string("")); break; } std::getline(*it->second, s); stack.push_back(s); break; }
+        case OpCode::OP_FWRITE: { auto dataAny = pop(stack); auto hAny = pop(stack); if (hAny.type()!=typeid(double) || dataAny.type()!=typeid(std::string)) { stack.push_back(false); break; } int h = static_cast<int>(std::any_cast<double>(hAny)); const std::string& data = std::any_cast<std::string>(dataAny); if (h==1) { std::cout << data; stack.push_back(true); break; } if (h==2) { std::cerr << data; stack.push_back(true); break; } auto it = streams.find(h); if (it==streams.end()) { stack.push_back(false); break; } (*it->second) << data; stack.push_back(it->second->good()); break; }
+        case OpCode::OP_OPCODE_ID: { auto nameAny = pop(stack); if (nameAny.type()!=typeid(std::string)) { stack.push_back(0.0); break; } const std::string& nm = std::any_cast<std::string>(nameAny); std::unordered_map<std::string, int> map = {
+            {"OP_CONST", (int)OpCode::OP_CONST}, {"OP_GET_GLOBAL", (int)OpCode::OP_GET_GLOBAL}, {"OP_SET_GLOBAL", (int)OpCode::OP_SET_GLOBAL},
+            {"OP_JUMP", (int)OpCode::OP_JUMP}, {"OP_JUMP_IF_FALSE", (int)OpCode::OP_JUMP_IF_FALSE}, {"OP_LOOP", (int)OpCode::OP_LOOP},
+            {"OP_CALL", (int)OpCode::OP_CALL}, {"OP_RETURN", (int)OpCode::OP_RETURN}, {"OP_GET_LOCAL", (int)OpCode::OP_GET_LOCAL}, {"OP_SET_LOCAL", (int)OpCode::OP_SET_LOCAL},
+            {"OP_ADD", (int)OpCode::OP_ADD}, {"OP_SUB", (int)OpCode::OP_SUB}, {"OP_MUL", (int)OpCode::OP_MUL}, {"OP_DIV", (int)OpCode::OP_DIV}, {"OP_MOD", (int)OpCode::OP_MOD},
+            {"OP_EQ", (int)OpCode::OP_EQ}, {"OP_NE", (int)OpCode::OP_NE}, {"OP_GT", (int)OpCode::OP_GT}, {"OP_GE", (int)OpCode::OP_GE}, {"OP_LT", (int)OpCode::OP_LT}, {"OP_LE", (int)OpCode::OP_LE},
+            {"OP_PRINT", (int)OpCode::OP_PRINT}, {"OP_HALT", (int)OpCode::OP_HALT}
+        }; auto it = map.find(nm); stack.push_back(it==map.end()? 0.0 : static_cast<double>(it->second)); break; }
         case OpCode::OP_ALLOC: { size_t n = static_cast<size_t>(std::max(0.0, popNum(stack))); auto b = std::make_shared<Block>(); b->data.assign(n, 0); int idx = static_cast<int>(heap.size()); heap.push_back(b); auto p = std::make_shared<Pointer>(); p->block = idx; p->offset = 0; stack.push_back(p); break; }
         case OpCode::OP_FREE: { auto anyP = pop(stack); if (anyP.type() != typeid(std::shared_ptr<Pointer>)) { stack.push_back(nullptr); break; } auto p = std::any_cast<std::shared_ptr<Pointer>>(anyP); if (p->block < 0 || p->block >= (int)heap.size() || !heap[p->block] || heap[p->block]->freed) { stack.push_back(nullptr); break; } heap[p->block]->freed = true; heap[p->block]->data.clear(); heap[p->block]->data.shrink_to_fit(); stack.push_back(nullptr); break; }
         case OpCode::OP_PTR_ADD: { double off = popNum(stack); auto anyP = pop(stack); if (anyP.type() != typeid(std::shared_ptr<Pointer>)) { stack.push_back(nullptr); break; } auto p = std::any_cast<std::shared_ptr<Pointer>>(anyP); auto np = std::make_shared<Pointer>(*p); long long delta = static_cast<long long>(off); if (delta < 0 && static_cast<size_t>(-delta) > np->offset) np->offset = 0; else np->offset += static_cast<size_t>(delta); stack.push_back(np); break; }
@@ -222,9 +328,437 @@ export int runChunk(const Chunk& chunk) {
         case OpCode::OP_PTR_OFFSET: { auto pAny = pop(stack); if (pAny.type()!=typeid(std::shared_ptr<Pointer>)) { stack.push_back(0.0); break; } auto p = std::any_cast<std::shared_ptr<Pointer>>(pAny); stack.push_back(static_cast<double>(p->offset)); break; }
         case OpCode::OP_PTR_BLOCK: { auto pAny = pop(stack); if (pAny.type()!=typeid(std::shared_ptr<Pointer>)) { stack.push_back(0.0); break; } auto p = std::any_cast<std::shared_ptr<Pointer>>(pAny); stack.push_back(static_cast<double>(p->block)); break; }
         case OpCode::OP_POP: { stack.pop_back(); break; }
-        case OpCode::OP_CALL: { std::uint16_t ni = readU16(pc); std::uint8_t argc = chunk.code[pc++]; const std::string& name = chunk.names[ni]; std::uint32_t entry = 0xFFFFFFFF; std::uint16_t arity = 0; for (const auto& f : chunk.functions) { if (chunk.names[f.nameIndex] == name) { entry = f.entry; arity = f.arity; break; } } if (entry == 0xFFFFFFFF) { reportRuntimeError(std::string("Undefined function: ") + name); return 1; } if (argc != arity) { reportRuntimeError(std::string("Arity mismatch for ") + name); return 1; } Frame fr; fr.returnPC = pc; fr.locals.resize(argc); for (int i = argc - 1; i >= 0; --i) { fr.locals[i] = stack.back(); stack.pop_back(); } frames.push_back(std::move(fr)); pc = entry; break; }
+        case OpCode::OP_CALL: { std::uint16_t ni = readU16(pc); if (pc == chunk.code.size()) return 1; std::uint8_t argc = readU8(pc); if (pc == chunk.code.size()) return 1; if (ni >= chunk.names.size()) { reportRuntimeError("call: invalid name index"); return 1; } const std::string& name = chunk.names[ni]; std::uint32_t entry = 0xFFFFFFFF; std::uint16_t arity = 0; for (const auto& f : chunk.functions) { if (chunk.names[f.nameIndex] == name) { entry = f.entry; arity = f.arity; break; } } if (entry == 0xFFFFFFFF) {
+                // Gracefully skip unknown calls: drop args, push nil, continue
+                reportRuntimeError(std::string("Undefined function: ") + name);
+                for (int i = 0; i < argc && !stack.empty(); ++i) stack.pop_back();
+                stack.push_back(nullptr);
+                break;
+            }
+            if (argc != arity) { reportRuntimeError(std::string("Arity mismatch for ") + name); return 1; }
+            if (stack.size() < argc) { reportRuntimeError("call: stack underflow"); return 1; }
+            Frame fr; fr.returnPC = static_cast<std::uint32_t>(pc); fr.locals.resize(argc); for (int i = argc - 1; i >= 0; --i) { fr.locals[i] = stack.back(); stack.pop_back(); } frames.push_back(std::move(fr)); pc = entry; break; }
         case OpCode::OP_RETURN: { if (frames.empty()) return 0; std::uint32_t ret = frames.back().returnPC; frames.pop_back(); pc = ret; break; }
+        case OpCode::OP_EMIT_CHUNK: {
+            // Top of stack: path (string); beneath: manifest (map)
+            auto pathAny = pop(stack);
+            auto manifestAny = pop(stack);
+            if (pathAny.type()!=typeid(std::string) || manifestAny.type()!=typeid(std::shared_ptr<Map>)) { stack.push_back(false); break; }
+            const std::string& outPath = std::any_cast<std::string>(pathAny);
+            auto m = std::any_cast<std::shared_ptr<Map>>(manifestAny);
+            // Expect entries: "constants" -> array, "names" -> array, "functions" -> array of {name,arity,entry}, "code" -> string (raw bytes), optional debug
+            Chunk out;
+            auto getArr = [&](const std::string& key)->std::shared_ptr<std::vector<std::any>>{
+                auto it = m->find(key); if (it==m->end()) return {};
+                if (it->second.type()!=typeid(std::shared_ptr<std::vector<std::any>>)) return {};
+                return std::any_cast<std::shared_ptr<std::vector<std::any>>>(it->second);
+            };
+            // constants
+            if (auto carr = getArr("constants")) {
+                for (const auto& v : *carr) {
+                    if (!v.has_value() || v.type()==typeid(std::nullptr_t)) out.constants.push_back(std::monostate{});
+                    else if (v.type()==typeid(double)) out.constants.push_back(std::any_cast<double>(v));
+                    else if (v.type()==typeid(std::string)) out.constants.push_back(std::any_cast<std::string>(v));
+                    else if (v.type()==typeid(bool)) out.constants.push_back(std::any_cast<bool>(v));
+                }
+            }
+            // names
+            if (auto narr = getArr("names")) { for (const auto& v : *narr) if (v.type()==typeid(std::string)) out.names.push_back(std::any_cast<std::string>(v)); }
+            // functions
+            if (auto farr = getArr("functions")) {
+                for (const auto& fnAny : *farr) {
+                    if (fnAny.type()!=typeid(std::shared_ptr<Map>)) continue;
+                    auto fm = std::any_cast<std::shared_ptr<Map>>(fnAny);
+                    std::uint16_t nameIdx = 0, ar = 0; std::uint32_t ent = 0;
+                    auto fnd = fm->find("nameIndex"); if (fnd!=fm->end() && fnd->second.type()==typeid(double)) nameIdx = static_cast<std::uint16_t>(std::any_cast<double>(fnd->second));
+                    fnd = fm->find("arity"); if (fnd!=fm->end() && fnd->second.type()==typeid(double)) ar = static_cast<std::uint16_t>(std::any_cast<double>(fnd->second));
+                    fnd = fm->find("entry"); if (fnd!=fm->end() && fnd->second.type()==typeid(double)) ent = static_cast<std::uint32_t>(std::any_cast<double>(fnd->second));
+                    out.functions.push_back({ nameIdx, ar, ent });
+                }
+            }
+            // code
+            {
+                auto it = m->find("code");
+                if (it!=m->end() && it->second.type()==typeid(std::string)) {
+                    const std::string& raw = std::any_cast<std::string>(it->second);
+                    out.code.assign(raw.begin(), raw.end());
+                }
+            }
+            // debug optional
+            if (auto dl = getArr("debugLines")) { for (const auto& v : *dl) if (v.type()==typeid(double)) out.debugLines.push_back(static_cast<std::uint32_t>(std::any_cast<double>(v))); }
+            if (auto dc = getArr("debugCols")) { for (const auto& v : *dc) if (v.type()==typeid(double)) out.debugCols.push_back(static_cast<std::uint32_t>(std::any_cast<double>(v))); }
+            std::ofstream ofs(outPath, std::ios::binary);
+            if (!ofs.is_open()) { stack.push_back(false); break; }
+            writeChunk(out, ofs);
+            ofs.flush();
+            stack.push_back(ofs.good());
+            break;
+        }
         case OpCode::OP_HALT: { stack.clear(); frames.clear(); globals.clear(); heap.clear(); if (memDbg) { std::cerr << "[mem] arrays: " << arraysCreated << "/" << arraysDestroyed << ", maps: " << mapsCreated << "/" << mapsDestroyed << "\n"; } return 0; }
+        case OpCode::OP_FFI_CALL: {
+            std::uint8_t argc = readU8(pc); if (pc == chunk.code.size()) return 1;
+            // stack layout: argN..arg1, dllName, funcName (we pushed args first, then dll, then func)
+            auto funcAny = pop(stack);
+            auto dllAny = pop(stack);
+            if (funcAny.type()!=typeid(std::string) || dllAny.type()!=typeid(std::string)) { stack.push_back(nullptr); break; }
+            if (!ffiEnabled) { reportRuntimeError("FFI is disabled (set CB_ENABLE_FFI=1 to enable)"); stack.push_back(nullptr); break; }
+            const std::string& func = std::any_cast<std::string>(funcAny);
+            const std::string& dll = std::any_cast<std::string>(dllAny);
+            void* pv = FFIConfig::loadProc(dll, func);
+            if (!pv) { reportRuntimeError(std::string("FFI symbol not found: ") + dll + ":" + func); stack.push_back(nullptr); break; }
+            // For safety, support only up to 4 integer/pointer args, returning integer.
+            auto popU64 = [&](std::vector<std::any>& s)->unsigned long long { double d = popNum(s); if (d < 0) return 0ULL; return static_cast<unsigned long long>(d); };
+            switch (argc) {
+                case 0: {
+                    unsigned long long (*f)() = reinterpret_cast<unsigned long long(*)()>(pv);
+                    unsigned long long r = f(); stack.push_back(static_cast<double>(r)); break; }
+                case 1: {
+                    unsigned long long a0 = popU64(stack);
+                    unsigned long long (*f)(unsigned long long) = reinterpret_cast<unsigned long long(*)(unsigned long long)>(pv);
+                    unsigned long long r = f(a0); stack.push_back(static_cast<double>(r)); break; }
+                case 2: {
+                    unsigned long long a1 = popU64(stack); unsigned long long a0 = popU64(stack);
+                    unsigned long long (*f)(unsigned long long,unsigned long long) = reinterpret_cast<unsigned long long(*)(unsigned long long,unsigned long long)>(pv);
+                    unsigned long long r = f(a0,a1); stack.push_back(static_cast<double>(r)); break; }
+                case 3: {
+                    unsigned long long a2 = popU64(stack); unsigned long long a1 = popU64(stack); unsigned long long a0 = popU64(stack);
+                    unsigned long long (*f)(unsigned long long,unsigned long long,unsigned long long) = reinterpret_cast<unsigned long long(*)(unsigned long long,unsigned long long,unsigned long long)>(pv);
+                    unsigned long long r = f(a0,a1,a2); stack.push_back(static_cast<double>(r)); break; }
+                case 4: {
+                    unsigned long long a3 = popU64(stack); unsigned long long a2 = popU64(stack); unsigned long long a1 = popU64(stack); unsigned long long a0 = popU64(stack);
+                    unsigned long long (*f)(unsigned long long,unsigned long long,unsigned long long,unsigned long long) = reinterpret_cast<unsigned long long(*)(unsigned long long,unsigned long long,unsigned long long,unsigned long long)>(pv);
+                    unsigned long long r = f(a0,a1,a2,a3); stack.push_back(static_cast<double>(r)); break; }
+                default: {
+                    reportRuntimeError("FFI only supports up to 4 numeric args right now"); stack.push_back(nullptr); break; }
+            }
+            break;
+        }
+        case OpCode::OP_FFI_CALL_SIG: {
+            std::uint8_t argc = readU8(pc); if (pc == chunk.code.size()) return 1;
+            // stack: argN..arg1, dll, func, sig
+            auto sigAny = pop(stack);
+            auto funcAny = pop(stack);
+            auto dllAny = pop(stack);
+            if (sigAny.type()!=typeid(std::string) || funcAny.type()!=typeid(std::string) || dllAny.type()!=typeid(std::string)) { stack.push_back(nullptr); break; }
+            if (!ffiEnabled) { reportRuntimeError("FFI is disabled (set CB_ENABLE_FFI=1 to enable)"); stack.push_back(nullptr); break; }
+            const std::string& sig = std::any_cast<std::string>(sigAny);
+            const std::string& func = std::any_cast<std::string>(funcAny);
+            const std::string& dll = std::any_cast<std::string>(dllAny);
+            void* pv = FFIConfig::loadProc(dll, func);
+            if (!pv) { reportRuntimeError(std::string("FFI symbol not found: ") + dll + ":" + func); stack.push_back(nullptr); break; }
+            // Signature mini-DSL: "ret(arg,arg,...)" where types are: i32,i64,u32,u64,f32,f64,ptr,void
+            // Example: "u32()", "u32(u32)", "f64(f64,f64)"
+            auto eatType = [&](const std::string& s, size_t& i)->std::string{
+                size_t j=i; while (j<s.size() && (std::isalnum((unsigned char)s[j]) || s[j]=='_')) j++; std::string t=s.substr(i,j-i); i=j; return t; };
+            size_t i=0; std::string ret = eatType(sig,i); if (i>=sig.size() || sig[i] != '(') { stack.push_back(nullptr); break; } i++;
+            std::vector<std::string> argTs; while (i<sig.size() && sig[i] != ')') { if (sig[i]==',') { i++; continue; } argTs.push_back(eatType(sig,i)); }
+            if (i>=sig.size() || sig[i] != ')') { stack.push_back(nullptr); break; }
+            // Currently support up to 4 args
+            if (argTs.size() != argc) { reportRuntimeError("FFI signature argc mismatch"); stack.push_back(nullptr); break; }
+            auto popU64 = [&](std::vector<std::any>& s)->unsigned long long { double d = popNum(s); return static_cast<unsigned long long>(d); };
+            auto popF64 = [&](std::vector<std::any>& s)->double { return popNum(s); };
+            // Collect args in reverse (stack is argN..arg1)
+            std::vector<unsigned long long> U(4,0ULL); std::vector<double> F(4,0.0);
+            std::vector<bool> isF(4,false);
+            std::vector<std::vector<char>> cstrBufs; cstrBufs.reserve(argc);
+            std::vector<std::wstring> wstrBufs; wstrBufs.reserve(argc);
+            for (int ai = static_cast<int>(argc) - 1; ai >= 0; --ai) {
+                const std::string& t = argTs[ai];
+                if (t=="i32"||t=="u32"||t=="i64"||t=="u64"||t=="ptr") { U[ai] = popU64(stack); isF[ai] = false; }
+                else if (t=="f32"||t=="f64") { F[ai] = popF64(stack); isF[ai] = true; }
+                else if (t=="cstr") {
+                    auto anyS = pop(stack);
+                    if (anyS.type()!=typeid(std::string)) { reportRuntimeError("FFI cstr expects string"); stack.push_back(nullptr); return 1; }
+                    const std::string& s = std::any_cast<std::string>(anyS);
+                    std::vector<char> buf; buf.reserve(s.size()+1); buf.assign(s.begin(), s.end()); buf.push_back('\0');
+                    cstrBufs.push_back(std::move(buf));
+                    U[ai] = reinterpret_cast<unsigned long long>(cstrBufs.back().data()); isF[ai] = false;
+                } else if (t=="wstr") {
+                    auto anyS = pop(stack);
+                    if (anyS.type()!=typeid(std::string)) { reportRuntimeError("FFI wstr expects string"); stack.push_back(nullptr); return 1; }
+                    const std::string& s8 = std::any_cast<std::string>(anyS);
+                    std::wstring ws; ws.reserve(s8.size()); for (unsigned char ch : s8) ws.push_back(static_cast<wchar_t>(ch));
+                    wstrBufs.push_back(std::move(ws));
+                    U[ai] = reinterpret_cast<unsigned long long>(wstrBufs.back().c_str()); isF[ai] = false;
+                } else { reportRuntimeError(std::string("FFI unknown arg type: ")+t); stack.push_back(nullptr); return 1; }
+            }
+            // Note: we push numeric returns as double; later we can add typed wrappers in CB code
+            if (argc == 0) {
+                if (ret=="void") { using Fn = void(*)(); reinterpret_cast<Fn>(pv)(); stack.push_back(true); }
+                else if (ret=="f64"||ret=="f32") { using Fn = double(*)(); double r = reinterpret_cast<Fn>(pv)(); stack.push_back(r); }
+                else { using Fn = unsigned long long(*)(); unsigned long long r = reinterpret_cast<Fn>(pv)(); stack.push_back(static_cast<double>(r)); }
+            } else if (argc == 1) {
+                bool a0f = isF[0];
+                if (a0f) {
+                    if (ret=="void") { using Fn = void(*)(double); reinterpret_cast<Fn>(pv)(F[0]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double); double r = reinterpret_cast<Fn>(pv)(F[0]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0]); stack.push_back(static_cast<double>(r)); }
+                } else {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long); reinterpret_cast<Fn>(pv)(U[0]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0]); stack.push_back(static_cast<double>(r)); }
+                }
+            } else if (argc == 2) {
+                bool a0f = isF[0]; bool a1f = isF[1];
+                if (!a0f && !a1f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],U[1]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],U[1]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,double); reinterpret_cast<Fn>(pv)(U[0],F[1]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(U[0],F[1]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f) {
+                    if (ret=="void") { using Fn = void(*)(double,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],U[1]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],U[1]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1]); stack.push_back(static_cast<double>(r)); }
+                } else {
+                    if (ret=="void") { using Fn = void(*)(double,double); reinterpret_cast<Fn>(pv)(F[0],F[1]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double); double r = reinterpret_cast<Fn>(pv)(F[0],F[1]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1]); stack.push_back(static_cast<double>(r)); }
+                }
+            } else if (argc == 3) {
+                bool a0f = isF[0], a1f = isF[1], a2f = isF[2];
+                if (!a0f && !a1f && !a2f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],U[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],U[1],U[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && !a1f && a2f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long,double); reinterpret_cast<Fn>(pv)(U[0],U[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(U[0],U[1],F[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && !a2f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,double,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],F[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],F[1],U[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && a2f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,double,double); reinterpret_cast<Fn>(pv)(U[0],F[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double,double); double r = reinterpret_cast<Fn>(pv)(U[0],F[1],F[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && !a2f) {
+                    if (ret=="void") { using Fn = void(*)(double,unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],U[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],U[1],U[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && a2f) {
+                    if (ret=="void") { using Fn = void(*)(double,unsigned long long,double); reinterpret_cast<Fn>(pv)(F[0],U[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(F[0],U[1],F[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && a1f && !a2f) {
+                    if (ret=="void") { using Fn = void(*)(double,double,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],F[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],F[1],U[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else {
+                    if (ret=="void") { using Fn = void(*)(double,double,double); reinterpret_cast<Fn>(pv)(F[0],F[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double,double); double r = reinterpret_cast<Fn>(pv)(F[0],F[1],F[2]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                }
+            } else if (argc == 4) {
+                bool a0f=isF[0], a1f=isF[1], a2f=isF[2], a3f=isF[3];
+                // 16 combinations
+                if (!a0f && !a1f && !a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long,unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],U[1],U[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long,unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],U[1],U[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long,unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1],U[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && !a1f && !a2f && a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long,unsigned long long,double); reinterpret_cast<Fn>(pv)(U[0],U[1],U[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long,unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(U[0],U[1],U[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long,unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1],U[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && !a1f && a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long,double,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],U[1],F[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long,double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],U[1],F[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long,double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1],F[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && !a1f && a2f && a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long,double,double); reinterpret_cast<Fn>(pv)(U[0],U[1],F[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long,double,double); double r = reinterpret_cast<Fn>(pv)(U[0],U[1],F[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long,double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1],F[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && !a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,double,unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],F[1],U[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double,unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],F[1],U[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,double,unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1],U[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && !a2f && a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,double,unsigned long long,double); reinterpret_cast<Fn>(pv)(U[0],F[1],U[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double,unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(U[0],F[1],U[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,double,unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1],U[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,double,double,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],F[1],F[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double,double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],F[1],F[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,double,double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1],F[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && a2f && a3f) {
+                    if (ret=="void") { using Fn = void(*)(unsigned long long,double,double,double); reinterpret_cast<Fn>(pv)(U[0],F[1],F[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double,double,double); double r = reinterpret_cast<Fn>(pv)(U[0],F[1],F[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(unsigned long long,double,double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1],F[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && !a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(double,unsigned long long,unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],U[1],U[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long,unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],U[1],U[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,unsigned long long,unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1],U[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && !a2f && a3f) {
+                    if (ret=="void") { using Fn = void(*)(double,unsigned long long,unsigned long long,double); reinterpret_cast<Fn>(pv)(F[0],U[1],U[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long,unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(F[0],U[1],U[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,unsigned long long,unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1],U[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(double,unsigned long long,double,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],U[1],F[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long,double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],U[1],F[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,unsigned long long,double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1],F[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && a2f && a3f) {
+                    if (ret=="void") { using Fn = void(*)(double,unsigned long long,double,double); reinterpret_cast<Fn>(pv)(F[0],U[1],F[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long,double,double); double r = reinterpret_cast<Fn>(pv)(F[0],U[1],F[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,unsigned long long,double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1],F[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && a1f && !a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(double,double,unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],F[1],U[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double,unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],F[1],U[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,double,unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1],U[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && a1f && !a2f && a3f) {
+                    if (ret=="void") { using Fn = void(*)(double,double,unsigned long long,double); reinterpret_cast<Fn>(pv)(F[0],F[1],U[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double,unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(F[0],F[1],U[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,double,unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1],U[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && a1f && a2f && !a3f) {
+                    if (ret=="void") { using Fn = void(*)(double,double,double,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],F[1],F[2],U[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double,double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],F[1],F[2],U[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,double,double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1],F[2],U[3]); stack.push_back(static_cast<double>(r)); }
+                } else { // a0f && a1f && a2f && a3f
+                    if (ret=="void") { using Fn = void(*)(double,double,double,double); reinterpret_cast<Fn>(pv)(F[0],F[1],F[2],F[3]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double,double,double); double r = reinterpret_cast<Fn>(pv)(F[0],F[1],F[2],F[3]); stack.push_back(r); }
+                    else { using Fn = unsigned long long(*)(double,double,double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1],F[2],F[3]); stack.push_back(static_cast<double>(r)); }
+                }
+            } else {
+                reportRuntimeError("FFI: more than 4 args not supported yet"); stack.push_back(nullptr);
+            }
+            break;
+        }
+        case OpCode::OP_FFI_PROC: {
+            auto fnAny = pop(stack);
+            auto dllAny = pop(stack);
+            if (dllAny.type()!=typeid(std::string)) { stack.push_back(0.0); break; }
+            const std::string& dll = std::any_cast<std::string>(dllAny);
+            void* p = nullptr;
+            if (fnAny.type()==typeid(std::string)) {
+                p = FFIConfig::loadProc(dll, std::any_cast<std::string>(fnAny));
+            } else if (fnAny.type()==typeid(double)) {
+                unsigned short ord = static_cast<unsigned short>(static_cast<unsigned long long>(std::any_cast<double>(fnAny)) & 0xFFFFULL);
+                p = FFIConfig::loadProcOrdinal(dll, ord);
+            }
+            stack.push_back(p ? static_cast<double>(reinterpret_cast<unsigned long long>(p)) : 0.0);
+            break;
+        }
+        case OpCode::OP_FFI_CALL_PTR: {
+            std::uint8_t argc = readU8(pc); if (pc == chunk.code.size()) return 1;
+            // stack: argN..arg1, ptr(number), sig(string)
+            auto sigAny = pop(stack);
+            auto ptrAny = pop(stack);
+            if (sigAny.type()!=typeid(std::string) || ptrAny.type()!=typeid(double)) { stack.push_back(nullptr); break; }
+            if (!ffiEnabled) { reportRuntimeError("FFI is disabled (set CB_ENABLE_FFI=1 to enable)"); stack.push_back(nullptr); break; }
+            const std::string& sig = std::any_cast<std::string>(sigAny);
+            void* pv = reinterpret_cast<void*>(static_cast<unsigned long long>(std::any_cast<double>(ptrAny)));
+            if (!pv) { stack.push_back(nullptr); break; }
+            // Reuse the same typed call engine by pretending dll/func;
+            // Duplicate parser and dispatcher: (parse sig, collect args, dispatch)
+            auto eatType = [&](const std::string& s, size_t& i)->std::string{ size_t j=i; while (j<s.size() && (std::isalnum((unsigned char)s[j]) || s[j]=='_')) j++; std::string t=s.substr(i,j-i); i=j; return t; };
+            size_t i=0; std::string ret = eatType(sig,i); if (i>=sig.size() || sig[i] != '(') { stack.push_back(nullptr); break; } i++;
+            std::vector<std::string> argTs; while (i<sig.size() && sig[i] != ')') { if (sig[i]==',') { i++; continue; } argTs.push_back(eatType(sig,i)); }
+            if (i>=sig.size() || sig[i] != ')') { stack.push_back(nullptr); break; }
+            if (argTs.size() != argc) { reportRuntimeError("FFI signature argc mismatch"); stack.push_back(nullptr); break; }
+            std::vector<unsigned long long> U(4,0ULL); std::vector<double> F(4,0.0); std::vector<bool> isF(4,false);
+            std::vector<std::vector<char>> cstrBufs; cstrBufs.reserve(argc);
+            std::vector<std::wstring> wstrBufs; wstrBufs.reserve(argc);
+            auto popU64 = [&](std::vector<std::any>& s)->unsigned long long { double d = popNum(s); return static_cast<unsigned long long>(d); };
+            auto popF64 = [&](std::vector<std::any>& s)->double { return popNum(s); };
+            for (int ai = static_cast<int>(argc) - 1; ai >= 0; --ai) {
+                const std::string& t = argTs[ai];
+                if (t=="i32"||t=="u32"||t=="i64"||t=="u64"||t=="ptr") { U[ai] = popU64(stack); isF[ai] = false; }
+                else if (t=="f32"||t=="f64") { F[ai] = popF64(stack); isF[ai] = true; }
+                else if (t=="cstr") {
+                    auto anyS = pop(stack);
+                    if (anyS.type()!=typeid(std::string)) { reportRuntimeError("FFI cstr expects string"); stack.push_back(nullptr); return 1; }
+                    const std::string& s = std::any_cast<std::string>(anyS);
+                    std::vector<char> buf; buf.reserve(s.size()+1); buf.assign(s.begin(), s.end()); buf.push_back('\0');
+                    cstrBufs.push_back(std::move(buf));
+                    U[ai] = reinterpret_cast<unsigned long long>(cstrBufs.back().data()); isF[ai] = false;
+                } else if (t=="wstr") {
+                    auto anyS = pop(stack);
+                    if (anyS.type()!=typeid(std::string)) { reportRuntimeError("FFI wstr expects string"); stack.push_back(nullptr); return 1; }
+                    const std::string& s8 = std::any_cast<std::string>(anyS);
+                    std::wstring ws; ws.reserve(s8.size()); for (unsigned char ch : s8) ws.push_back(static_cast<wchar_t>(ch));
+                    wstrBufs.push_back(std::move(ws));
+                    U[ai] = reinterpret_cast<unsigned long long>(wstrBufs.back().c_str()); isF[ai] = false;
+                } else { reportRuntimeError(std::string("FFI unknown arg type: ")+t); stack.push_back(nullptr); return 1; }
+            }
+            // Dispatch same as in OP_FFI_CALL_SIG for argc 0..4
+            if (argc == 0) {
+                if (ret=="void") { using Fn = void(*)(); reinterpret_cast<Fn>(pv)(); stack.push_back(true); }
+                else if (ret=="f64"||ret=="f32") { using Fn = double(*)(); double r = reinterpret_cast<Fn>(pv)(); stack.push_back(r); }
+                else { using Fn = unsigned long long(*)(); unsigned long long r = reinterpret_cast<Fn>(pv)(); stack.push_back(static_cast<double>(r)); }
+            } else if (argc == 1) {
+                bool a0f = isF[0];
+                if (a0f) { if (ret=="void") { using Fn = void(*)(double); reinterpret_cast<Fn>(pv)(F[0]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double); double r = reinterpret_cast<Fn>(pv)(F[0]); stack.push_back(r); } else { using Fn = unsigned long long(*)(double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0]); stack.push_back(static_cast<double>(r)); } }
+                else { if (ret=="void") { using Fn = void(*)(unsigned long long); reinterpret_cast<Fn>(pv)(U[0]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0]); stack.push_back(r); } else { using Fn = unsigned long long(*)(unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0]); stack.push_back(static_cast<double>(r)); } }
+            } else if (argc == 2) {
+                bool a0f=isF[0], a1f=isF[1];
+                if (!a0f && !a1f) { if (ret=="void") { using Fn = void(*)(unsigned long long,unsigned long long); reinterpret_cast<Fn>(pv)(U[0],U[1]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,unsigned long long); double r = reinterpret_cast<Fn>(pv)(U[0],U[1]); stack.push_back(r); } else { using Fn = unsigned long long(*)(unsigned long long,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],U[1]); stack.push_back(static_cast<double>(r)); } }
+                else if (!a0f && a1f) { if (ret=="void") { using Fn = void(*)(unsigned long long,double); reinterpret_cast<Fn>(pv)(U[0],F[1]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { using Fn = double(*)(unsigned long long,double); double r = reinterpret_cast<Fn>(pv)(U[0],F[1]); stack.push_back(r); } else { using Fn = unsigned long long(*)(unsigned long long,double); unsigned long long r = reinterpret_cast<Fn>(pv)(U[0],F[1]); stack.push_back(static_cast<double>(r)); } }
+                else if (a0f && !a1f) { if (ret=="void") { using Fn = void(*)(double,unsigned long long); reinterpret_cast<Fn>(pv)(F[0],U[1]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,unsigned long long); double r = reinterpret_cast<Fn>(pv)(F[0],U[1]); stack.push_back(r); } else { using Fn = unsigned long long(*)(double,unsigned long long); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],U[1]); stack.push_back(static_cast<double>(r)); } }
+                else { if (ret=="void") { using Fn = void(*)(double,double); reinterpret_cast<Fn>(pv)(F[0],F[1]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { using Fn = double(*)(double,double); double r = reinterpret_cast<Fn>(pv)(F[0],F[1]); stack.push_back(r); } else { using Fn = unsigned long long(*)(double,double); unsigned long long r = reinterpret_cast<Fn>(pv)(F[0],F[1]); stack.push_back(static_cast<double>(r)); } }
+            } else if (argc == 3) {
+                bool a0f=isF[0],a1f=isF[1],a2f=isF[2];
+                if (!a0f && !a1f && !a2f) {
+                    if (ret=="void") { reinterpret_cast<void(*)(unsigned long long,unsigned long long,unsigned long long)>(pv)(U[0],U[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(unsigned long long,unsigned long long,unsigned long long)>(pv)(U[0],U[1],U[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(unsigned long long,unsigned long long,unsigned long long)>(pv)(U[0],U[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && !a1f && a2f) {
+                    if (ret=="void") { reinterpret_cast<void(*)(unsigned long long,unsigned long long,double)>(pv)(U[0],U[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(unsigned long long,unsigned long long,double)>(pv)(U[0],U[1],F[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(unsigned long long,unsigned long long,double)>(pv)(U[0],U[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && !a2f) {
+                    if (ret=="void") { reinterpret_cast<void(*)(unsigned long long,double,unsigned long long)>(pv)(U[0],F[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(unsigned long long,double,unsigned long long)>(pv)(U[0],F[1],U[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(unsigned long long,double,unsigned long long)>(pv)(U[0],F[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (!a0f && a1f && a2f) {
+                    if (ret=="void") { reinterpret_cast<void(*)(unsigned long long,double,double)>(pv)(U[0],F[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(unsigned long long,double,double)>(pv)(U[0],F[1],F[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(unsigned long long,double,double)>(pv)(U[0],F[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && !a2f) {
+                    if (ret=="void") { reinterpret_cast<void(*)(double,unsigned long long,unsigned long long)>(pv)(F[0],U[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(double,unsigned long long,unsigned long long)>(pv)(F[0],U[1],U[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(double,unsigned long long,unsigned long long)>(pv)(F[0],U[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && !a1f && a2f) {
+                    if (ret=="void") { reinterpret_cast<void(*)(double,unsigned long long,double)>(pv)(F[0],U[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(double,unsigned long long,double)>(pv)(F[0],U[1],F[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(double,unsigned long long,double)>(pv)(F[0],U[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                } else if (a0f && a1f && !a2f) {
+                    if (ret=="void") { reinterpret_cast<void(*)(double,double,unsigned long long)>(pv)(F[0],F[1],U[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(double,double,unsigned long long)>(pv)(F[0],F[1],U[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(double,double,unsigned long long)>(pv)(F[0],F[1],U[2]); stack.push_back(static_cast<double>(r)); }
+                } else {
+                    if (ret=="void") { reinterpret_cast<void(*)(double,double,double)>(pv)(F[0],F[1],F[2]); stack.push_back(true); }
+                    else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(double,double,double)>(pv)(F[0],F[1],F[2]); stack.push_back(r); }
+                    else { unsigned long long r = reinterpret_cast<unsigned long long(*)(double,double,double)>(pv)(F[0],F[1],F[2]); stack.push_back(static_cast<double>(r)); }
+                }
+            } else if (argc == 4) {
+                bool a0f=isF[0],a1f=isF[1],a2f=isF[2],a3f=isF[3];
+                int mask = (a0f?1:0) | ((a1f?1:0)<<1) | ((a2f?1:0)<<2) | ((a3f?1:0)<<3);
+                switch (mask) {
+                    case 0x0: { if (ret=="void") { reinterpret_cast<void(*)(unsigned long long,unsigned long long,unsigned long long,unsigned long long)>(pv)(U[0],U[1],U[2],U[3]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(unsigned long long,unsigned long long,unsigned long long,unsigned long long)>(pv)(U[0],U[1],U[2],U[3]); stack.push_back(r); } else { unsigned long long r = reinterpret_cast<unsigned long long(*)(unsigned long long,unsigned long long,unsigned long long,unsigned long long)>(pv)(U[0],U[1],U[2],U[3]); stack.push_back(static_cast<double>(r)); } break; }
+                    case 0xF: { if (ret=="void") { reinterpret_cast<void(*)(double,double,double,double)>(pv)(F[0],F[1],F[2],F[3]); stack.push_back(true); } else if (ret=="f64"||ret=="f32") { double r = reinterpret_cast<double(*)(double,double,double,double)>(pv)(F[0],F[1],F[2],F[3]); stack.push_back(r); } else { unsigned long long r = reinterpret_cast<unsigned long long(*)(double,double,double,double)>(pv)(F[0],F[1],F[2],F[3]); stack.push_back(static_cast<double>(r)); } break; }
+                    default: { reportRuntimeError("FFI 4-arg mixed float/int call pattern not implemented here"); stack.push_back(nullptr); break; }
+                }
+            } else {
+                reportRuntimeError("FFI: more than 4 args not supported yet"); stack.push_back(nullptr);
+            }
+            break;
+        }
+        case OpCode::OP_CALLN_ARR: {
+            auto nameAny = pop(stack);
+            auto arrAny = pop(stack);
+            if (nameAny.type()!=typeid(std::string) || arrAny.type()!=typeid(std::shared_ptr<std::vector<std::any>>)) { stack.push_back(nullptr); break; }
+            const std::string& name = std::any_cast<std::string>(nameAny);
+            auto arr = std::any_cast<std::shared_ptr<std::vector<std::any>>>(arrAny);
+            std::uint32_t entry = 0xFFFFFFFF; std::uint16_t arity = 0;
+            for (const auto& f : chunk.functions) { if (chunk.names[f.nameIndex] == name) { entry = f.entry; arity = f.arity; break; } }
+            if (entry == 0xFFFFFFFF) { reportRuntimeError(std::string("Undefined function: ")+name); stack.push_back(nullptr); break; }
+            if (arity != arr->size()) { reportRuntimeError("Arity mismatch for "+name); stack.push_back(nullptr); break; }
+            Frame fr; fr.returnPC = static_cast<std::uint32_t>(pc); fr.locals.resize(arity);
+            for (int i = static_cast<int>(arity) - 1; i >= 0; --i) fr.locals[i] = (*arr)[i];
+            frames.push_back(std::move(fr)); pc = entry; break;
+        }
         default: return 1;
         }
     }

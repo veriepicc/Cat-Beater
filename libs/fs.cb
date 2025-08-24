@@ -1,0 +1,29 @@
+function Exists(path) {
+  return __file_exists(path);
+}
+function Read(path) {
+  return __read_file(path);
+}
+function Write(path, data) {
+  return __write_file(path, data);
+}
+function Append(path, data) {
+  let h = fopen(path, "a");
+  if (h > 0) {
+    let ok = fwrite(h, data);
+    fclose(h);
+    return ok;
+  }
+  false;
+}
+function Readline(path) {
+  let h = fopen(path, "r");
+  if (h > 0) {
+    let line = freadline(h);
+    fclose(h);
+    return line;
+  }
+  "";
+}
+
+

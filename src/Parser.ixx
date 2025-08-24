@@ -34,10 +34,26 @@ public:
         
         // Check for clearly concise-only syntax first
         
-        // fn NAME(PARAMS) { BODY } - unambiguously concise
+        // fn NAME(PARAMS) { BODY } - unambiguously concise ("rust syntax")
         if (check(TokenType::IDENTIFIER) && peek().lexeme == "fn") {
             advance(); // consume "fn"
             return parseConciseFunction();
+        }
+        // function NAME(PARAMS) { BODY } - modern aesthetic alias for concise form
+        if (check(TokenType::IDENTIFIER) && peek().lexeme == "function") {
+            advance(); // consume "function"
+            return parseConciseFunction();
+        }
+        // public/private function NAME(PARAMS) { BODY } - modifiers (no semantic effect yet)
+        if (check(TokenType::IDENTIFIER) && (peek().lexeme == "public" || peek().lexeme == "private")) {
+            int savedMod = current;
+            advance(); // consume modifier
+            if (check(TokenType::IDENTIFIER) && peek().lexeme == "function") {
+                advance(); // consume "function"
+                return parseConciseFunction();
+            }
+            // not a modern function with modifier; restore and continue
+            current = savedMod;
         }
         
         // if (CONDITION) { THEN } [else { ELSE }] - unambiguously concise (English uses "if X then")
@@ -88,11 +104,23 @@ public:
             }
         }
         
-        // IDENT = EXPR; (concise assignment)
+        // IDENT := EXPR; (terse declaration) or IDENT = EXPR; (concise assignment)
         if (check(TokenType::IDENTIFIER)) {
             int saved = current;
             Token name = advance();
-            if (check(TokenType::EQUAL)) {
+            // Terse declaration: name := expr
+            if (check(TokenType::COLON)) {
+                advance();
+                if (check(TokenType::EQUAL)) {
+                    advance();
+                    auto value = expression();
+                    match({TokenType::SEMICOLON});
+                    return std::make_unique<LetStmt>(name, std::make_unique<PrimitiveType>(Token{ TokenType::F64, "f64", {}, 0 }), std::move(value));
+                } else {
+                    // Not :=, roll back to before ':'
+                    current = saved;
+                }
+            } else if (check(TokenType::EQUAL)) {
                 advance(); // consume "="
                 auto value = expression();
                 match({TokenType::SEMICOLON}); // optional semicolon
@@ -103,6 +131,13 @@ public:
             }
         }
         
+        // Early handle 'return' inside concise blocks before expression fallback
+        if (check(TokenType::IDENTIFIER) && peek().lexeme == "return") {
+            advance();
+            auto value = expression();
+            return std::make_unique<ReturnStmt>(Token{ TokenType::RETURN, "return", {}, 0 }, std::move(value));
+        }
+
         // Any remaining expression followed by semicolon (like function calls)
         if (!check(TokenType::END_OF_FILE) && !check(TokenType::RIGHT_BRACE)) {
             int saved = current;
@@ -243,27 +278,45 @@ public:
             return std::make_unique<WhileStmt>(std::move(cond), std::move(body));
         }
         if (matchWord("print") || matchWord("say")) {
-            // print supports multiple arguments; each argument is a standard expression
-            // Stop when we see a token that clearly begins another command on the same line/block
-            auto nextStartsCommand = [&]() -> bool {
-                static const char* words[] = {
-                    "set", "let", "if", "while", "define", "append", "len", "return", "for", "else", "end"
+            // Support both concise: print(arg1, arg2, ...) and English: print EXPR EXPR ...
+            if (check(TokenType::LEFT_PAREN)) {
+                // Concise call form
+                advance(); // consume '('
+                std::vector<std::unique_ptr<Expr>> args;
+                if (!check(TokenType::RIGHT_PAREN)) {
+                    do { args.push_back(expression()); } while (match({ TokenType::COMMA }));
+                }
+                consume(TokenType::RIGHT_PAREN, "Expect ')' after arguments.");
+                match({ TokenType::SEMICOLON }); // optional semicolon
+                return std::make_unique<ExpressionStmt>(
+                    std::make_unique<Call>(
+                        std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "print", {}, 0 }),
+                        Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
+                        std::move(args)
+                    )
+                );
+            } else {
+                // English form: print A B C  (space-separated expressions)
+                auto nextStartsCommand = [&]() -> bool {
+                    static const char* words[] = {
+                        "set", "let", "if", "while", "define", "append", "len", "return", "for", "else", "end"
+                    };
+                    for (const char* w : words) { if (isWordAhead(w)) return true; }
+                    return false;
                 };
-                for (const char* w : words) { if (isWordAhead(w)) return true; }
-                return false;
-            };
-            std::vector<std::unique_ptr<Expr>> args;
-            while (!isAtEnd()) {
-                if (nextStartsCommand()) break;
-                try { args.push_back(expression()); } catch (const std::exception&) { break; }
+                std::vector<std::unique_ptr<Expr>> args;
+                while (!isAtEnd()) {
+                    if (nextStartsCommand()) break;
+                    try { args.push_back(expression()); } catch (const std::exception&) { break; }
+                }
+                return std::make_unique<ExpressionStmt>(
+                    std::make_unique<Call>(
+                        std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "print", {}, 0 }),
+                        Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
+                        std::move(args)
+                    )
+                );
             }
-            return std::make_unique<ExpressionStmt>(
-                std::make_unique<Call>(
-                    std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "print", {}, 0 }),
-                    Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
-                    std::move(args)
-                )
-            );
         }
         // join ARRAY by SEP
         if (matchWord("join")) {
@@ -716,8 +769,17 @@ private:
         consume(TokenType::RIGHT_PAREN, "Expect ')' after parameters.");
         
         auto retType = std::make_unique<PrimitiveType>(Token{ TokenType::F64, "f64", {}, 0 });
+        // Support modern single-expression form: function name(args) -> expr;
+        if (check(TokenType::ARROW)) {
+            advance(); // consume '->'
+            auto expr = expression();
+            match({TokenType::SEMICOLON});
+            std::vector<std::unique_ptr<Stmt>> body;
+            body.push_back(std::make_unique<ExpressionStmt>(std::move(expr)));
+            return std::make_unique<FunctionStmt>(name, std::move(params), std::move(retType), std::move(body));
+        }
+        // Otherwise expect a block body { ... }
         std::vector<std::unique_ptr<Stmt>> body = parseBlock();
-        
         return std::make_unique<FunctionStmt>(name, std::move(params), std::move(retType), std::move(body));
     }
     
@@ -726,28 +788,54 @@ private:
         consume(TokenType::LEFT_PAREN, "Expect '(' after 'if'.");
         auto condition = expression();
         consume(TokenType::RIGHT_PAREN, "Expect ')' after if condition.");
-        
-        std::vector<std::unique_ptr<Stmt>> thenBlock = parseBlock();
-        auto thenStmt = std::make_unique<BlockStmt>(std::move(thenBlock));
-        
+        // Support modern arrow single-statement form: if (cond) -> EXPR; [else -> EXPR;]
+        std::unique_ptr<Stmt> thenStmt;
         std::unique_ptr<Stmt> elseStmt;
-        if (matchWord("else")) {
-            std::vector<std::unique_ptr<Stmt>> elseBlock = parseBlock();
-            elseStmt = std::make_unique<BlockStmt>(std::move(elseBlock));
+        if (check(TokenType::ARROW)) {
+            advance(); // consume '->'
+            auto expr = expression();
+            match({TokenType::SEMICOLON});
+            thenStmt = std::make_unique<ExpressionStmt>(std::move(expr));
+            if (matchWord("else")) {
+                if (check(TokenType::ARROW)) {
+                    advance();
+                    auto eexpr = expression();
+                    match({TokenType::SEMICOLON});
+                    elseStmt = std::make_unique<ExpressionStmt>(std::move(eexpr));
+                } else {
+                    // else block
+                    std::vector<std::unique_ptr<Stmt>> elseBlock = parseBlock();
+                    elseStmt = std::make_unique<BlockStmt>(std::move(elseBlock));
+                }
+            }
+        } else {
+            // Classic concise block form
+            std::vector<std::unique_ptr<Stmt>> thenBlock = parseBlock();
+            thenStmt = std::make_unique<BlockStmt>(std::move(thenBlock));
+            if (matchWord("else")) {
+                std::vector<std::unique_ptr<Stmt>> elseBlock = parseBlock();
+                elseStmt = std::make_unique<BlockStmt>(std::move(elseBlock));
+            }
         }
-        
+
         return std::make_unique<IfStmt>(std::move(condition), std::move(thenStmt), std::move(elseStmt));
     }
     
     std::unique_ptr<Stmt> parseConciseWhile() {
-        // while (CONDITION) { BODY }
+        // while (CONDITION) { BODY }  or arrow form: while (COND) -> EXPR;
         consume(TokenType::LEFT_PAREN, "Expect '(' after 'while'.");
         auto condition = expression();
         consume(TokenType::RIGHT_PAREN, "Expect ')' after while condition.");
-        
-        std::vector<std::unique_ptr<Stmt>> bodyBlock = parseBlock();
-        auto bodyStmt = std::make_unique<BlockStmt>(std::move(bodyBlock));
-        
+        std::unique_ptr<Stmt> bodyStmt;
+        if (check(TokenType::ARROW)) {
+            advance(); // consume '->'
+            // Parse a full command (allows assignments, calls, etc.)
+            bodyStmt = parseCommand();
+            match({TokenType::SEMICOLON});
+        } else {
+            std::vector<std::unique_ptr<Stmt>> bodyBlock = parseBlock();
+            bodyStmt = std::make_unique<BlockStmt>(std::move(bodyBlock));
+        }
         return std::make_unique<WhileStmt>(std::move(condition), std::move(bodyStmt));
     }
     
@@ -1045,14 +1133,53 @@ private:
                 Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
                 std::move(args)
             );
+        } else if (matchWord("upper")) {
+            // upper STR -> __upper(STR)
+            auto s = expression();
+            std::vector<std::unique_ptr<Expr>> args; args.push_back(std::move(s));
+            expr = std::make_unique<Call>(
+                std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "__upper", {}, 0 }),
+                Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
+                std::move(args)
+            );
+        } else if (matchWord("lower")) {
+            // lower STR -> __lower(STR)
+            auto s = expression();
+            std::vector<std::unique_ptr<Expr>> args; args.push_back(std::move(s));
+            expr = std::make_unique<Call>(
+                std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "__lower", {}, 0 }),
+                Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
+                std::move(args)
+            );
+        } else if (matchWord("contains")) {
+            // contains NEEDLE in HAYSTACK -> __contains(HAYSTACK, NEEDLE)
+            auto needle = expression();
+            matchWord("in");
+            auto hay = expression();
+            std::vector<std::unique_ptr<Expr>> args; args.push_back(std::move(hay)); args.push_back(std::move(needle));
+            expr = std::make_unique<Call>(
+                std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "__contains", {}, 0 }),
+                Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
+                std::move(args)
+            );
+        } else if (matchWord("emit_chunk")) {
+            // emit_chunk MANIFEST PATH
+            auto manifest = expression();
+            auto path = expression();
+            std::vector<std::unique_ptr<Expr>> args; args.push_back(std::move(manifest)); args.push_back(std::move(path));
+            expr = std::make_unique<Call>(
+                std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "__emit_chunk", {}, 0 }),
+                Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
+                std::move(args)
+            );
         } else if (matchWord("concat")) {
             // concat A and B -> __str_cat(A, B)
             auto a = expression(); if (!match({ TokenType::AND })) { matchWord("and"); } auto b = expression();
-            std::vector<std::unique_ptr<Expr>> args; args.push_back(std::move(a)); args.push_back(std::move(b));
+            std::vector<std::unique_ptr<Expr>> args2; args2.push_back(std::move(a)); args2.push_back(std::move(b));
             expr = std::make_unique<Call>(
                 std::make_unique<Variable>(Token{ TokenType::IDENTIFIER, "__str_cat", {}, 0 }),
                 Token{ TokenType::LEFT_PAREN, "(", {}, 0 },
-                std::move(args)
+                std::move(args2)
             );
         } else if (matchWord("pack64")) {
             // pack64 N -> __pack_f64le(N)

@@ -75,6 +75,17 @@ export enum class OpCode : std::uint8_t {
     OP_SQRT,
     OP_ABS,
     OP_POW,
+    // Extended math
+    OP_EXP,
+    OP_LOG,
+    OP_SIN,
+    OP_COS,
+    OP_TAN,
+    OP_ASIN,
+    OP_ACOS,
+    OP_ATAN,
+    OP_ATAN2,
+    OP_RANDOM,
     OP_BAND,
     OP_BOR,
     OP_BXOR,
@@ -105,7 +116,31 @@ export enum class OpCode : std::uint8_t {
     OP_REALLOC,
     OP_BLOCK_SIZE,
     OP_PTR_OFFSET,
-    OP_PTR_BLOCK
+    OP_PTR_BLOCK,
+    // Rich strings
+    OP_STR_UPPER,
+    OP_STR_LOWER,
+    OP_STR_CONTAINS,
+    OP_FORMAT,     // u8 count (fmt + N args)
+    // Stream I/O
+    OP_FOPEN,      // expects path, mode
+    OP_FCLOSE,     // expects handle
+    OP_FREAD,      // expects handle, n -> string
+    OP_FWRITE,     // expects handle, data -> bool
+    OP_FREADLINE,  // expects handle -> string
+    OP_STDIN,
+    OP_STDOUT,
+    OP_STDERR,
+    // Chunk emission for self-host
+    OP_EMIT_CHUNK,  // expects manifest(map) and path(string); returns bool
+    // Opcode id helper
+    OP_OPCODE_ID,   // expects string name; returns numeric id (u8) as number
+    // Foreign function interface
+    OP_FFI_CALL,     // u8 argc; expects: argN..arg1, funcName(string), dllName(string)
+    OP_FFI_CALL_SIG  // u8 argc; expects: argN..arg1, dllName(string), funcName(string), signature(string)
+    ,OP_FFI_PROC     // expects: funcName(string or number=ordinal), dllName(string); pushes pointer (u64 as number)
+    ,OP_FFI_CALL_PTR // u8 argc; expects: argN..arg1, ptr(number), signature(string)
+    ,OP_CALLN_ARR    // expects: args(array), funcName(string)
 };
 
 export struct Chunk {

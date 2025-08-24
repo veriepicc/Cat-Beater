@@ -1,0 +1,41 @@
+function Push(a, v) {
+  __append(a, v);
+  a;
+}
+
+function Pop(a) {
+  return __pop(a);
+}
+
+function Slice(a, start, endIndex) {
+  let out = [];
+  let n = __len(a);
+  let i = start;
+  if (i < 0) { i = 0; }
+  if (endIndex > n) { endIndex = n; }
+  while (i < endIndex) {
+    Push(out, a[i]);
+    i = i + 1;
+  }
+  out;
+}
+
+function Reverse(a) {
+  let out = [];
+  let i = __len(a) - 1;
+  while (i >= 0) {
+    Push(out, a[i]);
+    i = i - 1;
+  }
+  out;
+}
+
+function Take(a, count) {
+  return Slice(a, 0, count);
+}
+
+function Drop(a, count) {
+  return Slice(a, count, __len(a));
+}
+
+

@@ -7,25 +7,22 @@ CatBeater is a small language that compiles to a custom bytecode and executes vi
 - **Source files**: `.cb` (CatBeater source)
 - **Compiled bytecode**: `.cat` (CatBeater bytecode)
 - **Execution mode**: Native runtime (bytecode executor) with optional experimental numeric JIT
-- **Dual syntax**: English and concise C-like forms (mix-and-match)
+- **Triple syntax**: English, concise C-like, and modern concise forms (mix-and-match)
 
 ## 🚀 Quick Start
 
-### Run Source (Native)
+### Compile and Run
 ```bash
-CatBeater.exe path\to\program.cb
-```
+# Compile to bytecode (.cat) [default]
+CatBeater.exe path\to\program.cb            # writes path\to\program.cat next to the source
+CatBeater.exe --emit out.cat path\to\program.cb
 
-### Emit Bytecode and Run
-```bash
-CatBeater.exe --emit program.cat path\to\program.cb
-CatBeater.exe program.cat
-```
-
-### Run Bytecode
-```bash
+# Run bytecode
 CatBeater.exe program.cat
 CatBeater.exe --run program.cat
+
+# Bundle to a self-contained EXE (optional)
+CatBeater.exe --bundle-exe program.exe path\to\program.cb
 ```
 
 ## 🤖 AI-Friendly Diagnostics and Auto-Fix
@@ -86,81 +83,6 @@ CatBeater.exe --run program.cat
   - The last expression in a function body is returned if no explicit return is used
 - **return EXPR**
 
-## 🛠️ Builtins (Language)
-
-### Arrays
-- `[x, y, z]` - Array literal
-- `a[i]` - Index access
-- `append v to a` / `push v onto a` - Add element
-- `pop from a` - Remove last element
-- `len a` / `length of a` - Array length
-
-### Strings/Maps (VM Support)
-- `char at I in S` - Character at index
-- `substring of S from A to B` - Extract substring
-- `find "needle" in S` - Find substring (index or -1)
-- `ord of S` / `chr N` - Character code conversion
-- `split S by SEP` - Split string by delimiter
-- `new map` / `set key K of M to V` / `get K from M` / `has K in M` / `does M have K` - Map operations
-
-### Packing & Helpers (VM Support)
-- `pack16 N` → 2 bytes (LE)
-- `pack32 N` → 4 bytes (LE)
-- `pack64 N` → 8 bytes (f64, LE)
-- `concat A and B` → string
-- `join ARRAY by SEP` → string
-- `trim S` → string
-- `replace S X with Y` → string
-- `assert COND` → fails if false; `panic MSG` → aborts with message
-- `parse int S` / `parse float S` - String parsing
-- `starts with P in S` / `ends with P in S` - String prefix/suffix
-- `delete key K from M` / `keys of M` - Map operations
-- `exists file PATH` - File existence check
-
-### Numeric/Math (VM Support)
-- `floor X`, `ceil X`, `round X`, `sqrt X`, `abs X`
-- `pow A by B` - Exponentiation
-
-### Bitwise (VM Support; numbers treated as 64-bit integers)
-- `band A and B`, `bor A and B`, `bxor A and B`
-- `shl A by B`, `shr A by B`
-
-### Strings
-- `tostring X` → string
-
-### Arrays
-- `reserve A by N`, `clear A`
-
-### Maps
-- `size of M`, `clear map M`
-
-### Process
-- `exit N`
-
-### Functions
-- `define function add with parameters a, b returning number: do ... end`
-- **Call forms**: `add(2,3)` or `call add with 2 and 3`
-
-## 💾 Memory (Native Runtime)
-
-| Operation | Description | Example |
-|-----------|-------------|---------|
-| `alloc N` | Allocate N bytes | `let p = alloc(64)` |
-| `free P` | Free pointer | `free(p)` |
-| `ptradd P by K` | Pointer at P+K | `let q = ptradd(p, 4)` |
-| `read8 P at K` | Read byte (0..255) | `let val = read8(p, 0)` |
-| `write8 V to P at K` | Write byte | `write8(65, p, 0)` |
-| `read16/32/64 P at K` | Read 16/32/64-bit value | `let val = read32(p, 4)` |
-| `write16/32/64 V to P at K` | Write 16/32/64-bit value | `write32(0x12345678, p, 4)` |
-| `readf32/writef32 V to P at K` | Read/write 32-bit float | `writef32(3.14, p, 8)` |
-| `memcpy DST SRC N` | Copy memory | `memcpy(dst, src, 32)` |
-| `memset DST VAL N` | Fill memory | `memset(p, 0, 64)` |
-| `ptrdiff A B` | Signed offset | `let diff = ptrdiff(p, q)` |
-| `realloc P SIZE` | Resize allocation | `let q = realloc(p, 128)` |
-| `blocksize P` | Block size in bytes | `let size = blocksize(p)` |
-| `ptroffset P` | Offset within block | `let offset = ptroffset(p)` |
-| `ptrblock P` | Block ID | `let id = ptrblock(p)` |
-
 ## 📋 Examples
 
 ### Math and Print
@@ -212,6 +134,37 @@ print add(2, 3)
 call add with 2 and 3
 ```
 
+### Concise and Modern Forms
+```c
+// Classic concise
+fn add(a, b) {
+    return a + b;
+}
+
+// Modern concise (alias)
+function add2(a, b) {
+    return a + b;
+}
+
+// Modern concise arrow forms
+function add3(a, b) -> a + b;
+
+// Arrow if
+if (x > 0) -> print("pos"); else -> print("neg");
+```
+
+### Rich strings and streams
+```bash
+print upper "hello"
+print lower "HELLO"
+print contains "cat" in "concatenate"
+print format("Hi, {}!", "world")
+
+let h be fopen("out.txt", "w")
+fwrite(h, "hello\n")
+fclose(h)
+```
+
 ### Memory
 ```bash
 let p be alloc 8
@@ -224,17 +177,110 @@ print read32 p at 4
 free p
 ```
 
+## 🛠️ Builtins (Language)
+
+### Arrays
+- `[x, y, z]` - Array literal
+- `a[i]` - Index access
+- `append v to a` / `push v onto a` - Add element
+- `pop from a` - Remove last element
+- `len a` / `length of a` - Array length
+
+### Strings/Maps (VM Support)
+- `char at I in S` - Character at index
+- `substring of S from A to B` - Extract substring
+- `find "needle" in S` - Find substring (index or -1)
+- `ord of S` / `chr N` - Character code conversion
+- `split S by SEP` - Split string by delimiter
+- `new map` / `set key K of M to V` / `get K from M` / `has K in M` / `does M have K` - Map operations
+
+### Packing & Helpers (VM Support)
+- `pack16 N` → 2 bytes (LE)
+- `pack32 N` → 4 bytes (LE)
+- `pack64 N` → 8 bytes (f64, LE)
+- `concat A and B` → string
+- `join ARRAY by SEP` → string
+- `trim S` → string
+- `replace S X with Y` → string
+- `upper S` / `lower S` → string
+- `contains NEEDLE in HAYSTACK` → bool
+- `format(fmt, ...args)` → string
+- `assert COND` → fails if false; `panic MSG` → aborts with message
+- `parse int S` / `parse float S` - String parsing
+- `starts with P in S` / `ends with P in S` - String prefix/suffix
+- `delete key K from M` / `keys of M` - Map operations
+- `exists file PATH` - File existence check
+
+### Numeric/Math (VM Support)
+- `floor X`, `ceil X`, `round X`, `sqrt X`, `abs X`
+- `pow A by B` - Exponentiation
+
+### Bitwise (VM Support; numbers treated as 64-bit integers)
+- `band A and B`, `bor A and B`, `bxor A and B`
+- `shl A by B`, `shr A by B`
+
+### Strings
+- `tostring X` → string
+
+### Arrays
+- `reserve A by N`, `clear A`
+
+### Maps
+- `size of M`, `clear map M`
+
+### Process
+- `exit N`
+ - `stdin()` / `stdout()` / `stderr()` → handles
+ - `fopen PATH MODE` / `fclose H` / `fread H N` / `freadline H` / `fwrite H DATA`
+
+### Functions
+- `define function add with parameters a, b returning number: do ... end`
+- **Call forms**: `add(2,3)` or `call add with 2 and 3`
+
+## 💾 Memory (Native Runtime)
+
+| Operation | Description | Example |
+|-----------|-------------|---------|
+| `alloc N` | Allocate N bytes | `let p = alloc(64)` |
+| `free P` | Free pointer | `free(p)` |
+| `ptradd P by K` | Pointer at P+K | `let q = ptradd(p, 4)` |
+| `read8 P at K` | Read byte (0..255) | `let val = read8(p, 0)` |
+| `write8 V to P at K` | Write byte | `write8(65, p, 0)` |
+| `read16/32/64 P at K` | Read 16/32/64-bit value | `let val = read32(p, 4)` |
+| `write16/32/64 V to P at K` | Write 16/32/64-bit value | `write32(0x12345678, p, 4)` |
+| `readf32/writef32 V to P at K` | Read/write 32-bit float | `writef32(3.14, p, 8)` |
+| `memcpy DST SRC N` | Copy memory | `memcpy(dst, src, 32)` |
+| `memset DST VAL N` | Fill memory | `memset(p, 0, 64)` |
+| `ptrdiff A B` | Signed offset | `let diff = ptrdiff(p, q)` |
+| `realloc P SIZE` | Resize allocation | `let q = realloc(p, 128)` |
+| `blocksize P` | Block size in bytes | `let size = blocksize(p)` |
+| `ptroffset P` | Offset within block | `let offset = ptroffset(p)` |
+| `ptrblock P` | Block ID | `let id = ptrblock(p)` |
+
+
 ## 🖥️ CLI Reference
 
 | Command | Description |
 |---------|-------------|
-| `CatBeater.exe program.cb` | Run source (native) |
-| `CatBeater.exe --emit program.cat program.cb` | Emit bytecode while running |
+| `CatBeater.exe program.cb` | Compile source to bytecode (.cat) |
+| `CatBeater.exe --emit program.cat program.cb` | Emit bytecode into provided path |
 | `CatBeater.exe program.cat` | Run bytecode |
 | `CatBeater.exe --run program.cat` | Run bytecode explicitly |
+| `CatBeater.exe --bundle-exe program.cb program.exe` | Create self-contained EXE (bundled) |
 | `CatBeater.exe` | Start REPL |
 
 ## 📁 File Types
+## 📦 Modules / Import
+
+- Use textual includes before parsing via either form (relative to the current file):
+  - `use "path/to/file.cb"`
+  - `import "path/to/file.cb"`
+- Includes are expanded recursively and guarded against cycles.
+- Recommended for sharing function definitions and constants between scripts.
+
+## 🧠 Closures and Scopes (planned)
+
+Closures and nested lexical scopes will be supported in a future native lowering.
 
 - **`.cb`**: CatBeater source (English-like)
 - **`.cat`**: CatBeater bytecode (binary)
@@ -271,9 +317,74 @@ free p
 ### 🚧 Not Yet Implemented
 - Closures
 - Nested lexical scopes with shadowing across blocks
-- Rich strings
-- Modules/import
-- I/O streams
+
+### 📦 Standard Library
+
+CatBeater now ships with a growing standard library written entirely in CatBeater itself. These modules provide common functionalities and serve as examples of modern concise CatBeater code.
+
+Refer to [libraries.md](libraries.md) for detailed documentation on all standard library functions.
+
+### 🔌 Foreign Function Interface (FFI)
+
+The FFI allows CatBeater to call functions from external C/C++ DLLs. This enables interoperability with system APIs, graphics libraries, and more.
+FFI calls require specifying the DLL name, function name (or ordinal), and a signature string for type marshaling.
+FFI is enabled by default. To disable, set environment variable `CB_ENABLE_FFI=0`.
+
+#### FFI Functions
+
+*   **`__ffi_call(dllName, funcName, ...args)`**
+    Calls a C function from `dllName` by `funcName`. All arguments are treated as 64-bit unsigned integers (`u64`), and the return value is also a `u64`.
+    ```cat
+    print(__ffi_call("kernel32.dll", "GetTickCount"))
+    ```
+
+*   **`__ffi_call_sig(dllName, funcName, signature, ...args)`**
+    Calls a C function with explicit type marshaling. The `signature` string defines return and argument types using a mini-DSL (e.g., "`u32(f64, i32)`").
+    
+    **Supported Types in Signature:** `i32`, `u32`, `i64`, `u64`, `f32`, `f64`, `ptr`, `cstr` (C-style string), `wstr` (Wide string/UTF-16).
+    
+    ```cat
+    ; Call a function returning u32 with no arguments
+    print(__ffi_call_sig("kernel32.dll", "GetCurrentProcessId", "u32()"))
+    
+    ; Call a function with float arguments and float return
+    print(__ffi_call_sig("msvcrt.dll", "pow", "f64(f64,f64)", 2, 3)) ; calculates 2^3
+    
+    ; Call with C-style string
+    print(__ffi_call_sig("msvcrt.dll", "strncmp", "i32(cstr,cstr,i32)", "foo", "foobar", 3))
+    
+    ; Call with Wide (UTF-16) string
+    print(__ffi_call_sig("kernel32.dll", "lstrlenW", "i32(wstr)", "hello"))
+    ```
+
+*   **`__ffi_proc(dllName, funcNameOrOrdinal)`**
+    Retrieves a function pointer (as a `u64` number) for a function in `dllName`. `funcNameOrOrdinal` can be a string (function name) or a number (ordinal).
+    This is useful for obtaining a function pointer once and calling it multiple times without repeated lookups.
+    ```cat
+    ; Get pointer to pow function by name
+    let pPow be __ffi_proc("msvcrt.dll", "pow")
+    
+    ; Get pointer to lstrlenA by ordinal (example ordinal, may vary by OS)
+    ; This will likely fail on your system as ordinals are not stable!
+    ; let pLenA be __ffi_proc("kernel32.dll", 0x0014) ; Example ordinal for lstrlenA
+    ```
+
+*   **`__ffi_call_ptr(signature, ptr, ...args)`**
+    Calls a function using a previously obtained function `ptr` and a `signature` string for type marshaling.
+    ```cat
+    ; Call pow using the pointer obtained above
+    print(__ffi_call_ptr("f64(f64,f64)", pPow, 2, 4)) ; calculates 2^4
+    
+    ; Call lstrlenA using its pointer
+    ; print(__ffi_call_ptr("i32(cstr)", pLenA, "abc"))
+    ```
+
+#### C++ Compatibility
+
+CatBeater's FFI aims for robust C-style interoperability. For C++ libraries, direct compatibility is limited:
+
+*   **Supported**: Calling `extern "C"` functions or C++ functions if their names are not mangled (or you provide the exact mangled name) and their signatures exclusively use primitive types (numbers, raw pointers, C-style strings).
+*   **Not Supported (Directly)**: C++ classes, member functions (without manual `this` pointer passing and specific export), templates, standard library types (e.g., `std::string`, `std::vector`), exceptions, and passing complex structs/objects by value. These typically require a C wrapper layer.
 
 ## 💡 Design Notes
 
@@ -283,6 +394,10 @@ free p
 - **Runtime errors**: Include file and line when available
 - **Memory debugging**: Set env `CB_MEMDBG=1` to print arrays/maps created/destroyed on halt
 - **Interpreter vs VM**: The interpreter may support more features than the VM; use during development when needed
+
+---
+
+**For detailed documentation on the standard library, see [libraries.md](libraries.md).**
 
 ---
 

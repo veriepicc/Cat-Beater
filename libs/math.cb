@@ -1,0 +1,463 @@
+function Clamp(x, lo, hi) {
+  if (x < lo) { return lo; }
+  if (x > hi) { return hi; }
+  x;
+}
+
+function Lerp(a, b, t) {
+  a + (b - a) * t;
+}
+
+function Abs(x) { return __abs(x); }
+function Floor(x) { return __floor(x); }
+function Ceil(x) { return __ceil(x); }
+function Round(x) { return __round(x); }
+function Sqrt(x) { return __sqrt(x); }
+function Pow(a, b) { return __pow(a, b); }
+
+
+// Core clamp and interpolation 
+function Clamp01(x) {
+  Clamp(x, 0, 1);
+}
+
+function LerpUnclamped(a, b, t) {
+  a + (b - a) * t;
+}
+
+// Modulo & helpers used below
+function Mod(a, b) {
+  a - b * Floor(a / b);
+}
+
+function InverseLerp(a, b, v) {
+  (v - a) / (b - a);
+}
+
+function LerpAngle(a, b, t) {
+  let d = Mod((b - a + 180), 360) - 180;
+  a + d * t;
+}
+
+function SmoothStep(a, b, x) {
+  let t = Clamp01((x - a) / (b - a));
+  t * t * (3 - 2 * t);
+}
+
+function Step(edge, x) {
+  if (x < edge) { return 0; }
+  1;
+}
+
+function Repeat(t, length) {
+  Mod(t, length);
+}
+
+function PingPong(t, length) {
+  let tt = Repeat(t, 2 * length);
+  length - Abs(tt - length);
+}
+
+function Remap(value, from1, to1, from2, to2) {
+  from2 + (value - from1) * (to2 - from2) / (to1 - from1);
+}
+
+// Rounding & signs 
+function Trunc(x) {
+  if (x > 0) { return Floor(x); }
+  Ceil(x);
+}
+
+function Sign(x) {
+  if (x > 0) { return 1; }
+  if (x < 0) { return -1; }
+  0;
+}
+
+// Powers and roots
+function Exp(x) { return __exp(x); }
+function Log(x) { return __log(x); }
+function Log10(x) { return __log(x) / __log(10); }
+function Cbrt(x) { return Pow(x, 1 / 3); }
+function InverseSqrt(x) { return 1 / Sqrt(x); }
+
+function Factorial(n) {
+  let r = 1;
+  let i = 2;
+  while (i <= n) { r = r * i; i = i + 1; }
+  r;
+}
+
+function Combinations(n, k) {
+  Factorial(n) / (Factorial(k) * Factorial(n - k));
+}
+
+// Trig & angles
+function Sin(x) { return __sin(x); }
+function Cos(x) { return __cos(x); }
+function Tan(x) { return __tan(x); }
+function ASin(x) { return __asin(x); }
+function ACos(x) { return __acos(x); }
+function ATan(x) { return __atan(x); }
+function ATan2(y, x) { return __atan2(y, x); }
+function DegToRad(d) { return d * 0.017453292519943295; }
+function RadToDeg(r) { return r * 57.29577951308232; }
+function WrapAngle(a) { return Mod(a + 180, 360) - 180; }
+
+// Min/Max
+function Min(a, b) { if (a < b) { return a; } b; }
+function Max(a, b) { if (a > b) { return a; } b; }
+
+// Randoms
+function Random() { return __random(); }
+function RandomRange(min, max) { return min + (max - min) * Random(); }
+function RandomInt(min, max) { return Floor(RandomRange(min, max + 1)); }
+
+// 2D Vectors (maps)
+function Vec2(x, y) {
+  let m = __new_map();
+  __map_set(m, "x", x);
+  __map_set(m, "y", y);
+  m;
+}
+
+function Vec2Add(a, b) { return Vec2(__map_get(a, "x") + __map_get(b, "x"), __map_get(a, "y") + __map_get(b, "y")); }
+function Vec2Sub(a, b) { return Vec2(__map_get(a, "x") - __map_get(b, "x"), __map_get(a, "y") - __map_get(b, "y")); }
+function Vec2Mul(a, s) { return Vec2(__map_get(a, "x") * s, __map_get(a, "y") * s); }
+function Vec2Div(a, s) { return Vec2(__map_get(a, "x") / s, __map_get(a, "y") / s); }
+function Vec2Dot(a, b) { return __map_get(a, "x") * __map_get(b, "x") + __map_get(a, "y") * __map_get(b, "y"); }
+function Vec2Length(a) { return Sqrt(__map_get(a, "x") * __map_get(a, "x") + __map_get(a, "y") * __map_get(a, "y")); }
+function Vec2Normalize(a) {
+  let l = Vec2Length(a);
+  if (l) { return Vec2(__map_get(a, "x") / l, __map_get(a, "y") / l); }
+  Vec2(0, 0);
+}
+function Vec2Distance(a, b) { return Vec2Length(Vec2Sub(a, b)); }
+function Vec2Angle(a, b) { return ATan2(__map_get(b, "y") - __map_get(a, "y"), __map_get(b, "x") - __map_get(a, "x")); }
+
+// 3D Vectors (maps)
+function Vec3(x, y, z) {
+  let m = __new_map();
+  __map_set(m, "x", x);
+  __map_set(m, "y", y);
+  __map_set(m, "z", z);
+  m;
+}
+
+function Vec3Add(a, b) { return Vec3(__map_get(a, "x") + __map_get(b, "x"), __map_get(a, "y") + __map_get(b, "y"), __map_get(a, "z") + __map_get(b, "z")); }
+function Vec3Sub(a, b) { return Vec3(__map_get(a, "x") - __map_get(b, "x"), __map_get(a, "y") - __map_get(b, "y"), __map_get(a, "z") - __map_get(b, "z")); }
+function Vec3Mul(a, s) { return Vec3(__map_get(a, "x") * s, __map_get(a, "y") * s, __map_get(a, "z") * s); }
+function Vec3Div(a, s) { return Vec3(__map_get(a, "x") / s, __map_get(a, "y") / s, __map_get(a, "z") / s); }
+function Vec3Dot(a, b) { return __map_get(a, "x") * __map_get(b, "x") + __map_get(a, "y") * __map_get(b, "y") + __map_get(a, "z") * __map_get(b, "z"); }
+function Vec3Cross(a, b) { return Vec3(__map_get(a, "y") * __map_get(b, "z") - __map_get(a, "z") * __map_get(b, "y"), __map_get(a, "z") * __map_get(b, "x") - __map_get(a, "x") * __map_get(b, "z"), __map_get(a, "x") * __map_get(b, "y") - __map_get(a, "y") * __map_get(b, "x")); }
+function Vec3Length(a) { return Sqrt(__map_get(a, "x") * __map_get(a, "x") + __map_get(a, "y") * __map_get(a, "y") + __map_get(a, "z") * __map_get(a, "z")); }
+function Vec3Normalize(a) {
+  let l = Vec3Length(a);
+  if (l) { return Vec3(__map_get(a, "x") / l, __map_get(a, "y") / l, __map_get(a, "z") / l); }
+  Vec3(0, 0, 0);
+}
+function Vec3Distance(a, b) { return Vec3Length(Vec3Sub(a, b)); }
+
+// 4D Vectors (maps)
+function Vec4(x, y, z, w) {
+  let m = __new_map();
+  __map_set(m, "x", x);
+  __map_set(m, "y", y);
+  __map_set(m, "z", z);
+  __map_set(m, "w", w);
+  m;
+}
+
+function Vec4Add(a, b) { return Vec4(__map_get(a, "x") + __map_get(b, "x"), __map_get(a, "y") + __map_get(b, "y"), __map_get(a, "z") + __map_get(b, "z"), __map_get(a, "w") + __map_get(b, "w")); }
+function Vec4Sub(a, b) { return Vec4(__map_get(a, "x") - __map_get(b, "x"), __map_get(a, "y") - __map_get(b, "y"), __map_get(a, "z") - __map_get(b, "z"), __map_get(a, "w") - __map_get(b, "w")); }
+function Vec4Mul(a, s) { return Vec4(__map_get(a, "x") * s, __map_get(a, "y") * s, __map_get(a, "z") * s, __map_get(a, "w") * s); }
+function Vec4Dot(a, b) { return __map_get(a, "x") * __map_get(b, "x") + __map_get(a, "y") * __map_get(b, "y") + __map_get(a, "z") * __map_get(b, "z") + __map_get(a, "w") * __map_get(b, "w"); }
+
+// Matrices (arrays of arrays)
+function MatIdentity(n) {
+  let m = [];
+  let i = 0;
+  while (i < n) {
+    let row = [];
+    let j = 0;
+    while (j < n) {
+      if (i == j) { __append(row, 1); } else { __append(row, 0); }
+      j = j + 1;
+    }
+    __append(m, row);
+    i = i + 1;
+  }
+  m;
+}
+
+function MatTranspose(m) {
+  let rows = __len(m);
+  let cols = __len(m[0]);
+  let r = [];
+  let i = 0;
+  while (i < cols) {
+    let row = [];
+    let j = 0;
+    while (j < rows) {
+      __append(row, m[j][i]);
+      j = j + 1;
+    }
+    __append(r, row);
+    i = i + 1;
+  }
+  r;
+}
+
+function MatMul(a, b) {
+  let r = [];
+  let rows = __len(a);
+  let cols = __len(b[0]);
+  let inner = __len(a[0]);
+  let i = 0;
+  while (i < rows) {
+    let row = [];
+    let j = 0;
+    while (j < cols) {
+      let sum = 0;
+      let k = 0;
+      while (k < inner) { sum = sum + a[i][k] * b[k][j]; k = k + 1; }
+      __append(row, sum);
+      j = j + 1;
+    }
+    __append(r, row);
+    i = i + 1;
+  }
+  r;
+}
+
+function MatDeterminant(m) {
+  let n = __len(m);
+  if (n == 1) { return m[0][0]; }
+  if (n == 2) { return m[0][0] * m[1][1] - m[0][1] * m[1][0]; }
+  let det = 0;
+  let i = 0;
+  while (i < n) {
+    // build submatrix excluding row 0 and column i
+    let sub = [];
+    let r = 1;
+    while (r < n) {
+      let row = [];
+      let c = 0;
+      while (c < n) {
+        if (c != i) { __append(row, m[r][c]); }
+        c = c + 1;
+      }
+      __append(sub, row);
+      r = r + 1;
+    }
+    det = det + Pow(-1, i) * m[0][i] * MatDeterminant(sub);
+    i = i + 1;
+  }
+  det;
+}
+
+function MatInverse(m) {
+  let n = __len(m);
+  let det = MatDeterminant(m);
+  if (!det) { return null; }
+  let inv = [];
+  let i = 0;
+  while (i < n) {
+    let row = [];
+    let j = 0;
+    while (j < n) {
+      let sub = [];
+      let ii = 0;
+      while (ii < n) {
+        if (ii != i) {
+          let rrow = [];
+          let jj = 0;
+          while (jj < n) {
+            if (jj != j) { __append(rrow, m[ii][jj]); }
+            jj = jj + 1;
+          }
+          __append(sub, rrow);
+        }
+        ii = ii + 1;
+      }
+      __append(row, Pow(-1, i + j) * MatDeterminant(sub) / det);
+      j = j + 1;
+    }
+    __append(inv, row);
+    i = i + 1;
+  }
+  MatTranspose(inv);
+}
+
+// Quaternions (maps)
+function Quat(w, x, y, z) {
+  let m = __new_map();
+  __map_set(m, "w", w);
+  __map_set(m, "x", x);
+  __map_set(m, "y", y);
+  __map_set(m, "z", z);
+  m;
+}
+function QuatIdentity() { return Quat(1, 0, 0, 0); }
+function QuatMul(a, b) {
+  let aw = __map_get(a, "w"); let ax = __map_get(a, "x"); let ay = __map_get(a, "y"); let az = __map_get(a, "z");
+  let bw = __map_get(b, "w"); let bx = __map_get(b, "x"); let by = __map_get(b, "y"); let bz = __map_get(b, "z");
+  Quat(aw*bw - ax*bx - ay*by - az*bz,
+       aw*bx + ax*bw + ay*bz - az*by,
+       aw*by - ax*bz + ay*bw + az*bx,
+       aw*bz + ax*by - ay*bx + az*bw);
+}
+function QuatConjugate(q) { return Quat(__map_get(q, "w"), -__map_get(q, "x"), -__map_get(q, "y"), -__map_get(q, "z")); }
+function QuatLength(q) { return Sqrt(__map_get(q, "w")*__map_get(q, "w") + __map_get(q, "x")*__map_get(q, "x") + __map_get(q, "y")*__map_get(q, "y") + __map_get(q, "z")*__map_get(q, "z")); }
+function QuatNormalize(q) {
+  let l = QuatLength(q);
+  if (l) { return Quat(__map_get(q, "w")/l, __map_get(q, "x")/l, __map_get(q, "y")/l, __map_get(q, "z")/l); }
+  QuatIdentity();
+}
+
+// Color helpers (maps)
+function RGB(r, g, b) { let m = __new_map(); __map_set(m, "r", r); __map_set(m, "g", g); __map_set(m, "b", b); return m; }
+function HSV(h, s, v) { let m = __new_map(); __map_set(m, "h", h); __map_set(m, "s", s); __map_set(m, "v", v); return m; }
+function HSVtoRGB(h, s, v) {
+  let c = v * s;
+  let x = c * (1 - Mod(h / 60, 2));
+  let m = v - c;
+  let r = 0; let g = 0; let b = 0;
+  if (h < 60) { r = c; g = x; }
+  else {
+    if (h < 120) { r = x; g = c; }
+    else {
+      if (h < 180) { g = c; b = x; }
+      else {
+        if (h < 240) { g = x; b = c; }
+        else {
+          if (h < 300) { r = x; b = c; }
+          else { r = c; b = x; }
+        }
+      }
+    }
+  }
+  RGB(r + m, g + m, b + m);
+}
+
+function __call_arr(f, arr) {
+  // f is expected to be a function name string; dispatch via intrinsic
+  __call_name_arr(f, arr);
+}
+
+// Calculus and numerical methods
+function Derivative(f, x, h) {
+  if (!h) { h = 0.00001; }
+  (__call_name_arr(f, [x + h]) - __call_name_arr(f, [x - h])) / (2 * h);
+}
+
+function Partial(f, vars, index, h) {
+  if (!h) { h = 0.00001; }
+  let x = [];
+  // copy vars
+  let i = 0; while (i < __len(vars)) { __append(x, vars[i]); i = i + 1; }
+  x[index] = x[index] + h;
+  let f1 = __call_name_arr(f, x);
+  x[index] = x[index] - 2 * h;
+  let f0 = __call_name_arr(f, x);
+  (f1 - f0) / (2 * h);
+}
+
+function Gradient(f, vars, h) {
+  if (!h) { h = 0.00001; }
+  let g = [];
+  let i = 0;
+  while (i < __len(vars)) {
+    __append(g, Partial(f, vars, i, h));
+    i = i + 1;
+  }
+  g;
+}
+
+function Integral(f, a, b, n) {
+  if (!n) { n = 1000; }
+  let h = (b - a) / n;
+  let sum = 0;
+  let i = 0;
+  while (i < n) {
+    sum = sum + 0.5 * (__call_name_arr(f, [a + i * h]) + __call_name_arr(f, [a + (i + 1) * h])) * h;
+    i = i + 1;
+  }
+  sum;
+}
+
+function Limit(f, x, dx) {
+  if (!dx) { dx = 0.0000001; }
+  Derivative(f, x, dx) + __call_name_arr(f, [x]) - __call_name_arr(f, [x]);
+}
+
+function Series(f, n) {
+  let s = 0;
+  let i = 0;
+  while (i < n) { s = s + __call_name_arr(f, [i]); i = i + 1; }
+  s;
+}
+
+function Sigmoid(x) { return 1 / (1 + Exp(-x)); }
+
+function Softmax(arr) {
+  // compute exponentials
+  let m = [];
+  let i = 0;
+  while (i < __len(arr)) { __append(m, Exp(arr[i])); i = i + 1; }
+  // sum
+  let s = 0; i = 0; while (i < __len(m)) { s = s + m[i]; i = i + 1; }
+  // normalize
+  let out = []; i = 0; while (i < __len(arr)) { __append(out, m[i] / s); i = i + 1; }
+  out;
+}
+
+function Erf(x) {
+  let a = 0.147;
+  let s = Sign(x);
+  let pi = 3.141592653589793;
+  let t = 1 - Exp(-(x*x)*(4/pi + a*x*x)/(1 + a));
+  s * Sqrt(t);
+}
+
+function Gamma(z) {
+  let pi = 3.141592653589793;
+  let g = 7;
+  let p = [0.99999999999980993, 676.5203681218851, -1259.1392167224028, 771.32342877765313, -176.61502916214059, 12.507343278686905, -0.13857109526572012, 0.0000099843695780195716, 0.00000015056327351493116];
+  if (z < 0.5) { return pi / (Sin(pi * z) * Gamma(1 - z)); }
+  z = z - 1;
+  let x = p[0];
+  let i = 1;
+  while (i < g + 2) { x = x + p[i] / (z + i); i = i + 1; }
+  let t = z + g + 0.5;
+  Sqrt(2 * pi) * Pow(t, z + 0.5) * Exp(-t) * x;
+}
+
+function Divergence(F, vars, h) {
+  if (!h) { h = 0.00001; }
+  let sum = 0;
+  let i = 0;
+  while (i < __len(vars)) { sum = sum + Partial(F, vars, i, h); i = i + 1; }
+  sum;
+}
+
+function Curl(F, vars, h) {
+  if (!h) { h = 0.00001; }
+  Vec3(Partial(F, vars, 2, h) - Partial(F, vars, 1, h),
+       Partial(F, vars, 0, h) - Partial(F, vars, 2, h),
+       Partial(F, vars, 1, h) - Partial(F, vars, 0, h));
+}
+
+function NewtonRaphson(f, df, x0, tol, maxIter) {
+  if (!tol) { tol = 0.0000001; }
+  if (!maxIter) { maxIter = 100; }
+  let x = x0;
+  let i = 0;
+  while (i < maxIter) {
+    let dx = __call_name_arr(f, [x]) / __call_name_arr(df, [x]);
+    x = x - dx;
+    if (Abs(dx) < tol) { return x; }
+    i = i + 1;
+  }
+  x;
+}

@@ -260,12 +260,16 @@ public:
         return {};
     }
     std::any visit(const Unary& expr) override {
-        expr.right->accept(*this);
         if (expr.op.type == TokenType::MINUS) {
+            // Emit 0 - value to implement unary minus correctly
             auto ci = chunk.addConstant(0.0);
             chunk.writeOp(OpCode::OP_CONST); chunk.writeU16(ci);
+            expr.right->accept(*this);
             chunk.writeOp(OpCode::OP_SUB);
+            return {};
         }
+        // Fallback: just evaluate the operand
+        expr.right->accept(*this);
         return {};
     }
     std::any visit(const Variable& expr) override {
@@ -278,6 +282,13 @@ public:
                     chunk.writeU16(it->second);
                     return {};
                 }
+            }
+        }
+        for (const auto& f : chunk.functions) {
+            if (chunk.names[f.nameIndex] == expr.name.lexeme) {
+                auto ci = chunk.addConstant(std::string(expr.name.lexeme));
+                chunk.writeOp(OpCode::OP_CONST); chunk.writeU16(ci);
+                return {};
             }
         }
         auto ni = chunk.addName(expr.name.lexeme);
@@ -379,6 +390,17 @@ public:
                 chunk.writeOp(OpCode::OP_JOIN);
                 return {};
             }
+            // rich strings
+            if (v->name.lexeme == "__upper" || v->name.lexeme == "upper") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_STR_UPPER); return {}; }
+            if (v->name.lexeme == "__lower" || v->name.lexeme == "lower") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_STR_LOWER); return {}; }
+            if (v->name.lexeme == "__contains" || v->name.lexeme == "contains") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_STR_CONTAINS); return {}; }
+            if (v->name.lexeme == "__format" || v->name.lexeme == "format") {
+                // push fmt + args; encode argc as immediate
+                for (const auto& a : expr.arguments) a->accept(*this);
+                chunk.writeOp(OpCode::OP_FORMAT);
+                chunk.writeByte(static_cast<std::uint8_t>(expr.arguments.size() - 1));
+                return {};
+            }
             if (v->name.lexeme == "__trim") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_TRIM); return {}; }
             if (v->name.lexeme == "__replace") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); expr.arguments[2]->accept(*this); chunk.writeOp(OpCode::OP_REPLACE); return {}; }
             if (v->name.lexeme == "__parse_int") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_PARSE_INT); return {}; }
@@ -389,12 +411,99 @@ public:
             if (v->name.lexeme == "__map_keys") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_MAP_KEYS); return {}; }
             if (v->name.lexeme == "__file_exists") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_FILE_EXISTS); return {}; }
             if (v->name.lexeme == "__to_string") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_TO_STRING); return {}; }
+            // streams
+            if (v->name.lexeme == "__fopen" || v->name.lexeme == "fopen") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_FOPEN); return {}; }
+            if (v->name.lexeme == "__fclose" || v->name.lexeme == "fclose") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_FCLOSE); return {}; }
+            if (v->name.lexeme == "__fread" || v->name.lexeme == "fread") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_FREAD); return {}; }
+            if (v->name.lexeme == "__freadline" || v->name.lexeme == "freadline") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_FREADLINE); return {}; }
+            if (v->name.lexeme == "__fwrite" || v->name.lexeme == "fwrite") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_FWRITE); return {}; }
+            if (v->name.lexeme == "__stdin" || v->name.lexeme == "stdin") { chunk.writeOp(OpCode::OP_STDIN); return {}; }
+            if (v->name.lexeme == "__stdout" || v->name.lexeme == "stdout") { chunk.writeOp(OpCode::OP_STDOUT); return {}; }
+            if (v->name.lexeme == "__stderr" || v->name.lexeme == "stderr") { chunk.writeOp(OpCode::OP_STDERR); return {}; }
+            if (v->name.lexeme == "__emit_chunk" || v->name.lexeme == "emit_chunk") {
+                // args: manifest(map), path(string)
+                expr.arguments[0]->accept(*this);
+                expr.arguments[1]->accept(*this);
+                chunk.writeOp(OpCode::OP_EMIT_CHUNK);
+                return {};
+            }
+            if (v->name.lexeme == "__ffi_call") {
+                // args: dllName, funcName, ...args
+                if (expr.arguments.size() < 2) { return {}; }
+                // Push call args first, then dllName, then funcName so VM can pop func then dll
+                if (expr.arguments.size() > 2) {
+                    for (size_t i = 2; i < expr.arguments.size(); ++i) expr.arguments[i]->accept(*this);
+                }
+                expr.arguments[0]->accept(*this); // dll
+                expr.arguments[1]->accept(*this); // func
+                chunk.writeOp(OpCode::OP_FFI_CALL);
+                chunk.writeByte(static_cast<std::uint8_t>(expr.arguments.size() - 2));
+                return {};
+            }
+            if (v->name.lexeme == "__ffi_call_sig") {
+                // args: dllName, funcName, signature, ...args
+                if (expr.arguments.size() < 3) { return {}; }
+                // Push call args first, then dll, then func, then signature so VM pops sig->func->dll
+                if (expr.arguments.size() > 3) {
+                    for (size_t i = 3; i < expr.arguments.size(); ++i) expr.arguments[i]->accept(*this);
+                }
+                expr.arguments[0]->accept(*this); // dll
+                expr.arguments[1]->accept(*this); // func
+                expr.arguments[2]->accept(*this); // signature
+                chunk.writeOp(OpCode::OP_FFI_CALL_SIG);
+                chunk.writeByte(static_cast<std::uint8_t>(expr.arguments.size() - 3));
+                return {};
+            }
+            if (v->name.lexeme == "__ffi_proc") {
+                // args: dllName, funcNameOrOrdinal
+                if (expr.arguments.size() != 2) { return {}; }
+                expr.arguments[0]->accept(*this); // dll
+                expr.arguments[1]->accept(*this); // func or ordinal
+                chunk.writeOp(OpCode::OP_FFI_PROC);
+                return {};
+            }
+            if (v->name.lexeme == "__ffi_call_ptr") {
+                // args: signature, ptr, ...args
+                if (expr.arguments.size() < 2) { return {}; }
+                if (expr.arguments.size() > 2) {
+                    for (size_t i = 2; i < expr.arguments.size(); ++i) expr.arguments[i]->accept(*this);
+                }
+                expr.arguments[1]->accept(*this); // ptr as number
+                expr.arguments[0]->accept(*this); // signature
+                chunk.writeOp(OpCode::OP_FFI_CALL_PTR);
+                chunk.writeByte(static_cast<std::uint8_t>(expr.arguments.size() - 2));
+                return {};
+            }
+            if (v->name.lexeme == "__opcode_id" || v->name.lexeme == "opcode_id") {
+                // one arg: name string
+                expr.arguments[0]->accept(*this);
+                chunk.writeOp(OpCode::OP_OPCODE_ID);
+                return {};
+            }
+            if (v->name.lexeme == "__call_name_arr") {
+                // args: funcName(string), argsArray(array)
+                // push argsArray, then name to match OP_CALLN_ARR expectation
+                expr.arguments[1]->accept(*this);
+                expr.arguments[0]->accept(*this);
+                chunk.writeOp(OpCode::OP_CALLN_ARR);
+                return {};
+            }
             if (v->name.lexeme == "__floor") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_FLOOR); return {}; }
             if (v->name.lexeme == "__ceil") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_CEIL); return {}; }
             if (v->name.lexeme == "__round") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_ROUND); return {}; }
             if (v->name.lexeme == "__sqrt") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_SQRT); return {}; }
             if (v->name.lexeme == "__abs") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_ABS); return {}; }
             if (v->name.lexeme == "__pow") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_POW); return {}; }
+            if (v->name.lexeme == "__exp") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_EXP); return {}; }
+            if (v->name.lexeme == "__log") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_LOG); return {}; }
+            if (v->name.lexeme == "__sin") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_SIN); return {}; }
+            if (v->name.lexeme == "__cos") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_COS); return {}; }
+            if (v->name.lexeme == "__tan") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_TAN); return {}; }
+            if (v->name.lexeme == "__asin") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_ASIN); return {}; }
+            if (v->name.lexeme == "__acos") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_ACOS); return {}; }
+            if (v->name.lexeme == "__atan") { expr.arguments[0]->accept(*this); chunk.writeOp(OpCode::OP_ATAN); return {}; }
+            if (v->name.lexeme == "__atan2") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_ATAN2); return {}; }
+            if (v->name.lexeme == "__random") { chunk.writeOp(OpCode::OP_RANDOM); return {}; }
             if (v->name.lexeme == "__band") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_BAND); return {}; }
             if (v->name.lexeme == "__bor") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_BOR); return {}; }
             if (v->name.lexeme == "__bxor") { expr.arguments[0]->accept(*this); expr.arguments[1]->accept(*this); chunk.writeOp(OpCode::OP_BXOR); return {}; }

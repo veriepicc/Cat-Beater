@@ -155,6 +155,7 @@
     <ClCompile Include="src\Bytecode.ixx" />
     <ClCompile Include="src\JIT.ixx" />
     <ClCompile Include="src\NativeExec.ixx" />
+    <ClCompile Include="src\FFI.ixx" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

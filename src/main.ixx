@@ -7,6 +7,10 @@ import <vector>;
 import <string>;
 import <memory>;
 import <cstdlib>;
+import <filesystem>;
+import <unordered_set>;
+import <cstdint>;
+import <cstring>;
 // English-only mode
 import Lexer;
 import Parser;
@@ -17,6 +21,60 @@ import Bytecode;
 import JIT;
 import Bytecode;
 import NativeExec;
+import FFI;
+
+// --- Bundling helpers (EXE) ---
+namespace {
+    struct CBPackFooter { char magic[8]; std::uint64_t payloadSize; };
+    static constexpr char CBPACK_MAGIC[8] = {'C','B','P','A','C','K','1','\0'};
+
+    static std::string makeAbsolute(const std::string& pathLike) {
+        std::error_code ec;
+        auto p = std::filesystem::path(pathLike);
+        if (!p.is_absolute()) p = std::filesystem::absolute(p, ec);
+        return p.string();
+    }
+
+    static bool tryLoadEmbeddedFromModule(const std::string& modulePath, std::string& outBytes) {
+        std::ifstream ifs(modulePath, std::ios::binary);
+        if (!ifs.is_open()) return false;
+        ifs.seekg(0, std::ios::end);
+        std::streamoff fileSize = ifs.tellg();
+        if (fileSize < static_cast<std::streamoff>(sizeof(CBPackFooter))) return false;
+        ifs.seekg(fileSize - static_cast<std::streamoff>(sizeof(CBPackFooter)), std::ios::beg);
+        CBPackFooter f{};
+        ifs.read(reinterpret_cast<char*>(&f), static_cast<std::streamsize>(sizeof(f)));
+        if (!ifs.good()) return false;
+        if (std::memcmp(f.magic, CBPACK_MAGIC, sizeof(CBPACK_MAGIC)) != 0) return false;
+        if (f.payloadSize == 0 || f.payloadSize > static_cast<std::uint64_t>(fileSize)) return false;
+        std::streamoff payloadPos = fileSize - static_cast<std::streamoff>(sizeof(CBPackFooter)) - static_cast<std::streamoff>(f.payloadSize);
+        if (payloadPos < 0) return false;
+        ifs.seekg(payloadPos, std::ios::beg);
+        outBytes.resize(static_cast<size_t>(f.payloadSize));
+        if (f.payloadSize) ifs.read(&outBytes[0], static_cast<std::streamsize>(f.payloadSize));
+        return ifs.good();
+    }
+
+    static bool writeBundledFile(const std::string& stubPath, const std::string& outPath, const Chunk& chunk) {
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(outPath).parent_path(), ec);
+        std::filesystem::copy_file(stubPath, outPath, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) { std::cerr << "bundle: failed to copy stub from '" << stubPath << "' to '" << outPath << "': " << ec.message() << std::endl; return false; }
+        std::ofstream ofs(outPath, std::ios::binary | std::ios::app);
+        if (!ofs.is_open()) { std::cerr << "bundle: could not open output for append: " << outPath << std::endl; return false; }
+        std::ostringstream payload;
+        writeChunk(chunk, payload);
+        const std::string bytes = payload.str();
+        ofs.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+        CBPackFooter f{};
+        std::memcpy(f.magic, CBPACK_MAGIC, sizeof(CBPACK_MAGIC));
+        f.payloadSize = static_cast<std::uint64_t>(bytes.size());
+        ofs.write(reinterpret_cast<const char*>(&f), static_cast<std::streamsize>(sizeof(f)));
+        ofs.flush();
+        if (!ofs.good()) { std::cerr << "bundle: failed writing payload/footer." << std::endl; return false; }
+        return true;
+    }
+}
 
 // Simple helpers for suggestions and auto-fixes
 static bool envFlag(const char* name) {
@@ -45,6 +103,127 @@ static bool envFlagDefaultOn(const char* name) {
     return on;
 }
 struct Fix { std::string suggestion; std::string fixed; };
+static std::string readAllText(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) return std::string();
+    std::stringstream b; b << f.rdbuf();
+    return b.str();
+}
+
+static std::string expandImports(const std::string& source, const std::filesystem::path& baseDir, std::unordered_set<std::string>& visiting) {
+    std::stringstream out;
+    std::istringstream iss(source);
+    std::string line;
+    auto ltrim = [](std::string& s){ while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin()); };
+    auto rtrim = [](std::string& s){ while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back(); };
+    while (std::getline(iss, line)) {
+        std::string t = line; ltrim(t); rtrim(t);
+        bool isImport = false;
+        size_t pos = std::string::npos;
+        if (t.rfind("use \"", 0) == 0) { isImport = true; pos = 4; }
+        if (!isImport && t.rfind("import \"", 0) == 0) { isImport = true; pos = 7; }
+        // Modern/English includes
+        if (!isImport && t.rfind("include \"", 0) == 0) { isImport = true; pos = 8; }
+        // C-style #include "path"
+        if (!isImport && t.rfind("#include \"", 0) == 0) { isImport = true; pos = 10; }
+        if (isImport) {
+            size_t q1 = t.find('"', pos);
+            size_t q2 = (q1 == std::string::npos) ? std::string::npos : t.find('"', q1 + 1);
+            if (q1 != std::string::npos && q2 != std::string::npos && q2 > q1 + 1) {
+                std::string rel = t.substr(q1 + 1, q2 - q1 - 1);
+                std::filesystem::path child = baseDir / rel;
+                std::error_code ec; auto canonical = std::filesystem::weakly_canonical(child, ec);
+                std::string key = canonical.string();
+                if (!key.empty() && visiting.insert(key).second) {
+                    std::string childSrc = readAllText(key);
+                    if (!childSrc.empty()) {
+                        out << "/* begin import: " << key << " */\n";
+                        out << expandImports(childSrc, canonical.parent_path(), visiting);
+                        out << "\n/* end import: " << key << " */\n";
+                        continue;
+                    }
+                }
+            }
+        }
+        out << line << "\n";
+    }
+    return out.str();
+}
+
+// Map each physical line in the expanded source back to its originating file and local line number
+struct LineOrigin { std::string filePath; std::uint32_t localLine; };
+static std::vector<LineOrigin> buildLineOrigins(const std::string& expandedSource, const std::string& rootPath) {
+    std::vector<LineOrigin> origins;
+    struct Frame { std::string file; std::uint32_t line; };
+    std::vector<Frame> stack;
+    stack.push_back(Frame{ rootPath, 0 });
+
+    std::istringstream iss(expandedSource);
+    std::string line;
+    auto ltrim = [](std::string& s){ while (!s.empty() && std::isspace((unsigned char)s.front())) s.erase(s.begin()); };
+    auto rtrim = [](std::string& s){ while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back(); };
+    while (std::getline(iss, line)) {
+        std::string t = line; ltrim(t); rtrim(t);
+        // Detect our include sentinels exactly as emitted by expandImports
+        if (t.rfind("/* begin import: ", 0) == 0 && t.size() >= 4 && t.substr(t.size()-2) == "*/") {
+            // Extract path between prefix and suffix
+            std::string inside = t.substr(std::string("/* begin import: ").size());
+            if (inside.size() >= 2 && inside.substr(inside.size()-2) == "*/") inside.resize(inside.size()-2);
+            // Trim trailing space
+            while (!inside.empty() && std::isspace((unsigned char)inside.back())) inside.pop_back();
+            if (!inside.empty()) {
+                stack.push_back(Frame{ inside, 0 });
+            }
+            // Record origin for this sentinel line as belonging to the new frame (line 0 -> will ++ below)
+        } else if (t.rfind("/* end import: ", 0) == 0 && t.size() >= 4 && t.substr(t.size()-2) == "*/") {
+            if (stack.size() > 1) stack.pop_back();
+        }
+        // Increment line in current frame and record origin
+        if (!stack.empty()) {
+            stack.back().line += 1;
+            origins.push_back(LineOrigin{ stack.back().file, stack.back().line });
+        } else {
+            // Fallback to root if stack somehow empty
+            origins.push_back(LineOrigin{ rootPath, static_cast<std::uint32_t>(origins.size()+1) });
+        }
+    }
+    return origins;
+}
+
+// Count occurrences of a word (e.g., "end"/"do") outside of quotes and with balanced ()[]{} depth == 0
+static int countWordOutsideQuotesAndBalanced(const std::string& s, const std::string& word) {
+    int count = 0;
+    bool inQuote = false;
+    int paren = 0, bracket = 0, brace = 0;
+    for (size_t i = 0; i < s.size(); ++i) {
+        char c = s[i];
+        if (!inQuote) {
+            if (c == '"') { inQuote = true; continue; }
+            if (c == '(') { paren++; continue; }
+            if (c == ')') { if (paren > 0) paren--; continue; }
+            if (c == '[') { bracket++; continue; }
+            if (c == ']') { if (bracket > 0) bracket--; continue; }
+            if (c == '{') { brace++; continue; }
+            if (c == '}') { if (brace > 0) brace--; continue; }
+            if (paren == 0 && bracket == 0 && brace == 0) {
+                // Try match word here
+                if (c == word[0]) {
+                    size_t remaining = s.size() - i;
+                    if (remaining >= word.size() && s.compare(i, word.size(), word) == 0) {
+                        // Check word boundaries: prev not [A-Za-z0-9_], next not [A-Za-z0-9_]
+                        bool prevOk = (i == 0) || !(std::isalnum((unsigned char)s[i-1]) || s[i-1] == '_');
+                        bool nextOk = (i + word.size() >= s.size()) || !(std::isalnum((unsigned char)s[i + word.size()]) || s[i + word.size()] == '_');
+                        if (prevOk && nextOk) { count++; i += word.size() - 1; continue; }
+                    }
+                }
+            }
+        } else {
+            if (c == '"') { inQuote = false; }
+        }
+    }
+    return count;
+}
+
 
 static bool suggestFix(const std::string& chunk, Fix& out) {
     // operate on first line only
@@ -125,6 +304,13 @@ void runFile(const std::string& path, bool /*useVM*/, const std::string& outByte
     std::ifstream file(path);
     if (!file.is_open()) { std::cerr << "Could not open file: " << path << std::endl; return; }
     std::stringstream buffer; buffer << file.rdbuf(); std::string source = buffer.str();
+    // Expand simple imports/includes: use "path" or import "path"
+    try {
+        std::unordered_set<std::string> visiting; std::filesystem::path base = std::filesystem::path(path).parent_path();
+        source = expandImports(source, base, visiting);
+    } catch (...) {}
+    // Build origin map for error reporting across includes
+    std::vector<LineOrigin> origins = buildLineOrigins(source, path);
     std::vector<std::unique_ptr<Stmt>> program;
     std::vector<std::uint32_t> stmtLines; std::vector<std::uint32_t> stmtCols;
     int appliedFixes = 0;
@@ -161,23 +347,38 @@ void runFile(const std::string& path, bool /*useVM*/, const std::string& outByte
         auto count_char = [](const std::string& s, char c){ int cnt=0; for(char ch : s) if(ch==c) cnt++; return cnt; };
         
         // Count both English block markers and concise block markers
-        int opens = count_sub(trimmed, " do") + count_char(trimmed, '{');
-        int closes = ((trimmed == "end") ? 1 : count_sub(trimmed, " end")) + count_char(trimmed, '}');
+        int opens = countWordOutsideQuotesAndBalanced(trimmed, "do") + count_char(trimmed, '{');
+        int closes = countWordOutsideQuotesAndBalanced(trimmed, "end") + count_char(trimmed, '}');
         
         std::uint32_t stmtStartLine = currentLine; std::uint32_t stmtStartCol = static_cast<std::uint32_t>(firstNs + 1);
-        while (opens > closes) { 
-            std::string next; 
-            if (!std::getline(iss, next)) break; 
-            std::string t = next; ltrim(t); rtrim(t); 
-            if (t.empty() || t[0]==';' || t[0]=='#' || t.substr(0,2)=="//") continue; 
-            chunk += "\n" + t; 
-            opens += count_sub(t, " do") + count_char(t, '{'); 
-            closes += ((t == "end") ? 1 : count_sub(t, " end")) + count_char(t, '}'); 
-            currentLine++; 
+        while (opens > closes) {
+            std::string next;
+            if (!std::getline(iss, next)) break;
+            currentLine++;
+            std::string t = next; ltrim(t); rtrim(t);
+            if (t.empty() || t[0]==';' || t[0]=='#' || t.substr(0,2)=="//") { continue; }
+            // Skip block comments (and import sentinels) entirely
+            if (t.substr(0, 2) == "/*") {
+                bool foundEnd = t.find("*/") != std::string::npos;
+                while (!foundEnd && std::getline(iss, next)) {
+                    currentLine++;
+                    std::string t2 = next; ltrim(t2); rtrim(t2);
+                    if (t2.find("*/") != std::string::npos) { foundEnd = true; break; }
+                }
+                continue;
+            }
+            chunk += "\n" + t;
+            opens += countWordOutsideQuotesAndBalanced(t, "do") + count_char(t, '{');
+            closes += countWordOutsideQuotesAndBalanced(t, "end") + count_char(t, '}');
         }
         try { Lexer elex(chunk, static_cast<int>(stmtStartLine)); auto etoks = elex.scanTokens(); Parser eparser(etoks); auto stmt = eparser.parseCommand(); program.push_back(std::move(stmt)); stmtLines.push_back(stmtStartLine); stmtCols.push_back(stmtStartCol); }
         catch (const std::exception& e) {
-            std::cerr << "Parse Error at line " << stmtStartLine << ": " << e.what() << std::endl;
+            std::cerr << "Parse Error at line " << stmtStartLine << ": " << e.what();
+            if (stmtStartLine > 0 && stmtStartLine <= origins.size()) {
+                const auto& o = origins[stmtStartLine - 1];
+                std::cerr << "\n  at " << o.filePath << ":" << o.localLine;
+            }
+            std::cerr << std::endl;
             Fix fx; bool autoFix = envFlagDefaultOn("CB_AUTOFIX");
             if (suggestFix(chunk, fx) && autoFix) {
                 try { Lexer elex2(fx.fixed, static_cast<int>(stmtStartLine)); auto toks2 = elex2.scanTokens(); Parser eparser2(toks2); auto stmt2 = eparser2.parseCommand(); program.push_back(std::move(stmt2)); stmtLines.push_back(stmtStartLine); stmtCols.push_back(stmtStartCol); appliedFixes++; }
@@ -189,6 +390,9 @@ void runFile(const std::string& path, bool /*useVM*/, const std::string& outByte
     if (!outBytecodePath.empty()) { std::ofstream ofs(outBytecodePath, std::ios::binary); if (ofs.is_open()) { writeChunk(cg.chunk, ofs); ofs.flush(); if (!ofs.good()) { std::cerr << "Failed writing bytecode: " << outBytecodePath << std::endl; } else { std::cout << "Wrote bytecode: " << outBytecodePath << std::endl; } } }
     (void)runChunk(cg.chunk);
 }
+
+
+// Interpreter mode removed (use native runtime + JIT)
 
 
 void runBytecodeFile(const std::string& path) {
@@ -233,6 +437,13 @@ static int compileToChunk(const std::string& path, Chunk& outChunk, const std::s
     std::ifstream file(path);
     if (!file.is_open()) { std::cerr << "Could not open file: " << path << std::endl; return 1; }
     std::stringstream buffer; buffer << file.rdbuf(); std::string source = buffer.str();
+    // Expand simple imports/includes
+    try {
+        std::unordered_set<std::string> visiting; std::filesystem::path base = std::filesystem::path(path).parent_path();
+        source = expandImports(source, base, visiting);
+    } catch (...) {}
+    // Build origin map for error reporting across includes
+    std::vector<LineOrigin> origins = buildLineOrigins(source, path);
     std::vector<std::unique_ptr<Stmt>> program;
     std::vector<std::uint32_t> stmtLines;
     std::vector<std::uint32_t> stmtCols;
@@ -272,19 +483,29 @@ static int compileToChunk(const std::string& path, Chunk& outChunk, const std::s
         auto count_char = [](const std::string& s, char c){ int cnt=0; for(char ch : s) if(ch==c) cnt++; return cnt; };
         
         // Count both English block markers and concise block markers
-        int opens = count_sub(trimmed, " do") + count_char(trimmed, '{');
-        int closes = ((trimmed == "end") ? 1 : count_sub(trimmed, " end")) + count_char(trimmed, '}');
+        int opens = countWordOutsideQuotesAndBalanced(trimmed, "do") + count_char(trimmed, '{');
+        int closes = countWordOutsideQuotesAndBalanced(trimmed, "end") + count_char(trimmed, '}');
         std::uint32_t stmtStartLine = currentLine;
         std::uint32_t stmtStartCol = static_cast<std::uint32_t>(firstNs + 1);
         while (opens > closes) {
             std::string next;
             if (!std::getline(iss, next)) break;
-            std::string t = next; ltrim(t); rtrim(t);
-            if (t.empty() || t[0]==';' || t[0]=='#' || t.substr(0,2)=="//") continue;
-            chunk += "\n" + t;
-            opens += count_sub(t, " do") + count_char(t, '{');
-            closes += ((t == "end") ? 1 : count_sub(t, " end")) + count_char(t, '}');
             currentLine++;
+            std::string t = next; ltrim(t); rtrim(t);
+            if (t.empty() || t[0]==';' || t[0]=='#' || t.substr(0,2)=="//") { continue; }
+            // Skip block comments (and import sentinels) entirely
+            if (t.substr(0, 2) == "/*") {
+                bool foundEnd = t.find("*/") != std::string::npos;
+                while (!foundEnd && std::getline(iss, next)) {
+                    currentLine++;
+                    std::string t2 = next; ltrim(t2); rtrim(t2);
+                    if (t2.find("*/") != std::string::npos) { foundEnd = true; break; }
+                }
+                continue;
+            }
+            chunk += "\n" + t;
+            opens += countWordOutsideQuotesAndBalanced(t, "do") + count_char(t, '{');
+            closes += countWordOutsideQuotesAndBalanced(t, "end") + count_char(t, '}');
         }
         try {
             Lexer elex(chunk, static_cast<int>(stmtStartLine));
@@ -295,7 +516,12 @@ static int compileToChunk(const std::string& path, Chunk& outChunk, const std::s
             stmtLines.push_back(stmtStartLine);
             stmtCols.push_back(stmtStartCol);
         } catch (const std::exception& e) {
-            std::cerr << "Parse Error at line " << stmtStartLine << ": " << e.what() << std::endl;
+            std::cerr << "Parse Error at line " << stmtStartLine << ": " << e.what();
+            if (stmtStartLine > 0 && stmtStartLine <= origins.size()) {
+                const auto& o = origins[stmtStartLine - 1];
+                std::cerr << "\n  at " << o.filePath << ":" << o.localLine;
+            }
+            std::cerr << std::endl;
             Fix fx; bool autoFix = envFlagDefaultOn("CB_AUTOFIX");
             if (suggestFix(chunk, fx)) {
                 std::cerr << "Suggestion: " << fx.suggestion << "\nTry: " << fx.fixed << std::endl;
@@ -314,18 +540,95 @@ static int compileToChunk(const std::string& path, Chunk& outChunk, const std::s
 }
 
 int main(int argc, char* argv[]) {
+    FFIConfig::initDefaultSearchDirs();
+    {
+        auto addFromEnv = [&](const char* name){
+            char* envVal = nullptr; size_t envLen = 0;
+#if defined(_MSC_VER)
+            if (_dupenv_s(&envVal, &envLen, name) == 0 && envVal && envLen > 0) {
+                std::string v(envVal);
+                std::string cur;
+                for (char c : v) {
+                    if (c == ';' || c == ':') { if (!cur.empty()) { FFIConfig::addSearchDir(cur); cur.clear(); } }
+                    else { cur.push_back(c); }
+                }
+                if (!cur.empty()) FFIConfig::addSearchDir(cur);
+            }
+            if (envVal) { free(envVal); envVal = nullptr; }
+#else
+            const char* v = std::getenv(name);
+            if (v && v[0]) {
+                std::string s(v);
+                std::string cur;
+                for (char c : s) {
+                    if (c == ';' || c == ':') { if (!cur.empty()) { FFIConfig::addSearchDir(cur); cur.clear(); } }
+                    else { cur.push_back(c); }
+                }
+                if (!cur.empty()) FFIConfig::addSearchDir(cur);
+            }
+#endif
+        };
+        addFromEnv("CB_DLL_PATH");
+    }
+    // If invoked without args, try run embedded payload from the exe itself
+    if (argc <= 1) {
+        std::string selfPath = makeAbsolute(argv[0] ? argv[0] : "");
+        std::string payload;
+        if (!selfPath.empty() && tryLoadEmbeddedFromModule(selfPath, payload)) {
+            std::istringstream iss(std::string(payload.data(), payload.size()));
+            try { Chunk c = loadChunk(iss); return runChunk(c); } catch (const std::exception& e) { std::cerr << "Embedded run error: " << e.what() << std::endl; return 1; }
+        }
+    }
+
     bool useVM = false;
     bool useNative = true;
+    bool useInterp = false; // deprecated
+    bool useJIT = false;
     std::string script;
     bool runBytecode = false;
     std::string outBytecode;
+    // Bundling options
+    bool bundleExe = false;
+    std::string outExePath;
+    std::string catInputPath; // optional: bundle an existing .cat
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--vm") { useVM = true; continue; }
+        // --interp removed; keep parsing for compatibility but ignore
+        if (arg == "--interp" || arg == "--interpreter") { continue; }
+        if (arg == "--jit") { useJIT = true; continue; }
         if (arg == "--native") { useNative = true; useVM = false; continue; }
         if (arg == "--emit" && i + 1 < argc) { outBytecode = argv[++i]; continue; }
         if (arg == "--run" && i + 1 < argc) { runBytecode = true; script = argv[++i]; continue; }
+        if (arg == "--bundle-exe" && i + 2 < argc) { bundleExe = true; script = argv[++i]; outExePath = argv[++i]; continue; }
+        if (arg == "--cat" && i + 1 < argc) { catInputPath = argv[++i]; continue; }
         script = arg;
+    }
+
+    // Bundling flow
+    if (bundleExe) {
+        Chunk c;
+        int ec = 0;
+        if (!catInputPath.empty()) {
+            std::ifstream ifs(catInputPath, std::ios::binary);
+            if (!ifs.is_open()) { std::cerr << "bundle: could not open .cat: " << catInputPath << std::endl; return 1; }
+            try { c = loadChunk(ifs); } catch (const std::exception& e) { std::cerr << "bundle: invalid .cat: " << e.what() << std::endl; return 1; }
+        } else {
+            if (script.empty()) { std::cerr << "bundle: missing source path (.cb or .cat)." << std::endl; return 1; }
+            if (script.size() >= 4 && script.substr(script.size()-4) == ".cat") {
+                std::ifstream ifs(script, std::ios::binary);
+                if (!ifs.is_open()) { std::cerr << "bundle: could not open .cat: " << script << std::endl; return 1; }
+                try { c = loadChunk(ifs); } catch (const std::exception& e) { std::cerr << "bundle: invalid .cat: " << e.what() << std::endl; return 1; }
+            } else {
+                ec = compileToChunk(script, c, "");
+                if (ec != 0) return ec;
+            }
+        }
+        std::string selfPath = makeAbsolute(argv[0] ? argv[0] : "");
+        if (selfPath.empty()) { std::cerr << "bundle: could not determine stub exe path." << std::endl; return 1; }
+        if (!writeBundledFile(selfPath, outExePath, c)) return 1;
+        std::cout << "Wrote bundled exe: " << outExePath << std::endl;
+        return 0;
     }
 
     if (runBytecode) {
@@ -341,7 +644,8 @@ int main(int argc, char* argv[]) {
             if (!ifs.is_open()) { std::cerr << "Could not open bytecode: " << script << std::endl; return 1; }
             try { Chunk c = loadChunk(ifs); return runChunk(c); } catch (const std::exception& e) { std::cerr << "Error loading bytecode: " << e.what() << std::endl; return 1; }
         }
-        if (useNative) {
+        if (useNative && useJIT) {
+            // Native JIT evaluation of last numeric expression
             std::ifstream file(script);
             if (!file.is_open()) { std::cerr << "Could not open file: " << script << std::endl; return 1; }
             std::stringstream buffer; buffer << file.rdbuf(); std::string source = buffer.str();
@@ -367,7 +671,6 @@ int main(int argc, char* argv[]) {
                     std::cerr << "Parse Error at line " << lineNo << ": " << e.what() << std::endl;
                 }
             }
-            // Find last ExpressionStmt and try to JIT it if it's a pure numeric expression
             const ExpressionStmt* lastExprStmt = nullptr;
             for (auto it = program.rbegin(); it != program.rend(); ++it) {
                 if (auto* es = dynamic_cast<ExpressionStmt*>(it->get())) { lastExprStmt = es; break; }
@@ -382,10 +685,18 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
             double result = jit.executeExpression(lastExprStmt->expression.get());
-            // Print like interpreter: integers without decimal when whole
             double tr = std::trunc(result);
             if (std::fabs(result - tr) < 1e-12) { std::cout << static_cast<long long>(tr) << std::endl; }
             else { std::cout << result << std::endl; }
+        } else if (useNative) {
+            // Default: compile to .cat next to the source (or to --emit path)
+            std::filesystem::path sp(script);
+            std::filesystem::path outPath = sp;
+            if (!outBytecode.empty()) outPath = outBytecode; else outPath.replace_extension(".cat");
+            Chunk c;
+            int ec = compileToChunk(script, c, outPath.string());
+            if (ec != 0) return ec;
+            // no run by default
         } else {
             runFile(script, useVM, outBytecode);
         }
@@ -393,10 +704,18 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "Welcome to the CatBeater compiler (native)." << std::endl;
-    // Always: compile test.cat English to bytecode, then run bytecode natively.
+    // Run test.cat by default, then execute any selfhosted bytecode if present
     {
-        Chunk c; int ec = compileToChunk("test.cat", c, "");
+        // Compile the self-host compiler to bytecode and run it, so it can emit demo.cat
+        Chunk c; int ec = compileToChunk("test_modern.cat", c, "");
         if (ec == 0) { (void)runChunk(c); }
+        // If a self-hosted bytecode was produced (selfhost/demo.cat), run it
+        std::ifstream shifs("selfhost/demo.cat", std::ios::binary);
+        if (shifs.is_open()) {
+            try { Chunk sc = loadChunk(shifs); (void)runChunk(sc); } catch (...) {}
+        } else {
+            std::cerr << "[selfhost] no demo.cat produced.\n";
+        }
     }
     std::cout << "\n";
     runEnglishRepl();

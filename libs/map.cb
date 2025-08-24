@@ -1,0 +1,16 @@
+function New() {
+  __new_map();
+}
+
+function Set(m, key, val) {
+  __map_set(m, key, val);
+  m;
+}
+
+function Get(m, key) { return __map_get(m, key); }
+function Has(m, key) { return __map_has(m, key); }
+function Del(m, key) { return __map_del(m, key); }
+function Keys(m) { return __map_keys(m); }
+function Size(m) { return __map_size(m); }
+function Clear(m) { return __map_clear(m); }
+

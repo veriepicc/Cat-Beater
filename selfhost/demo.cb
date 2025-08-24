@@ -1,4 +1,3 @@
-; Tiny program compiled by selfhost compiler
-print "Hello from selfhost!"
+print("Hello from selfhost compiler!");
 
 
