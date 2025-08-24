@@ -6,7 +6,6 @@
 
 1. **Language**: Build a readable, English-style language that scales from calculator to systems programming
 2. **Bootstrap**: Re-implement the CatBeater compiler in CatBeater itself (self-hosting)
-3. **Machine**: Target a native bytecode executor suitable for OS-level work
 
 ## 🚀 Status (v0.4: Native executor, console, variables, functions, arrays, memory, dual syntax)
 
